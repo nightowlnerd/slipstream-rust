@@ -148,3 +148,40 @@ jobs:
           name: bench-${{ matrix.name }}-logs
           path: .interop/bench-${{ matrix.name }}-*
           include-hidden-files: true
+
+  bench-memory:
+    name: Bench Memory (rust-rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out slipstream-rust
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev python3 procps
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run memory benchmark
+        env:
+          TRANSFER_BYTES: "104857600"
+          RUNS: "1"
+          RUN_EXFIL: "1"
+          RUN_DOWNLOAD: "1"
+          SOCKET_TIMEOUT: "60"
+          MAX_RSS_MB: "80"
+          MIN_AVG_MIB_S: "0"
+        run: ./scripts/bench/run_rust_rust_mem.sh
+
+      - name: Upload memory logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-rust-rust-mem-logs
+          path: .interop/mem-rust-rust-*.csv
+          include-hidden-files: true

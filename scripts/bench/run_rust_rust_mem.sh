@@ -14,6 +14,7 @@ RUN_EXFIL="${RUN_EXFIL:-1}"
 RUN_DOWNLOAD="${RUN_DOWNLOAD:-1}"
 MEM_SAMPLE_SECS="${MEM_SAMPLE_SECS:-0.2}"
 MEM_LOG="${MEM_LOG:-${ROOT_DIR}/.interop/mem-rust-rust-$(date +%Y%m%d_%H%M%S).csv}"
+MAX_RSS_MB="${MAX_RSS_MB:-80}"
 
 mkdir -p "$(dirname "${MEM_LOG}")"
 
@@ -58,7 +59,17 @@ done
 wait "${BENCH_PID}"
 
 if [[ -s "${MEM_LOG}" ]]; then
-  awk -F, 'NR>1 { if ($2+0 > maxs) maxs=$2+0; if ($3+0 > maxc) maxc=$3+0 }
-    END { printf "Peak RSS (KB): server=%d client=%d\n", maxs, maxc }' "${MEM_LOG}"
+  read -r maxs maxc < <(awk -F, 'NR>1 { if ($2+0 > maxs) maxs=$2+0; if ($3+0 > maxc) maxc=$3+0 }
+    END { printf "%d %d", maxs+0, maxc+0 }' "${MEM_LOG}") || true
+  maxs="${maxs:-0}"
+  maxc="${maxc:-0}"
+  printf "Peak RSS (KB): server=%d client=%d\n" "${maxs}" "${maxc}"
+  if [[ "${MAX_RSS_MB}" != "0" ]]; then
+    max_kb=$((MAX_RSS_MB * 1024))
+    if [[ "${maxs}" -gt "${max_kb}" || "${maxc}" -gt "${max_kb}" ]]; then
+      echo "Peak RSS exceeded ${MAX_RSS_MB}MB (server=${maxs}KB client=${maxc}KB)." >&2
+      exit 1
+    fi
+  fi
 fi
 echo "mem log: ${MEM_LOG}"

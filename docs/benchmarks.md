@@ -6,12 +6,18 @@ Benchmark harnesses live under scripts/bench and write artifacts under .interop/
 
 - Run the Rust <-> Rust harness:
   TRANSFER_BYTES=10485760 ./scripts/bench/run_rust_rust_10mb.sh
+- Run the Rust <-> Rust memory sampler:
+  TRANSFER_BYTES=10485760 ./scripts/bench/run_rust_rust_mem.sh
 - Run the C <-> C harness:
   TRANSFER_BYTES=10485760 ./scripts/bench/run_c_c_10mb.sh
 - Artifacts are written under .interop/bench-*-<timestamp>/.
 - Use RUNS=5 to repeat runs; multi-run outputs are stored under run-N/.
 - End-to-end timing is measured from the first payload byte sent to the last
   payload byte received.
+- Rust <-> Rust runs enforce a minimum average MiB/s threshold (MIN_AVG_MIB_S, default 10)
+  for both exfil and download.
+- The Rust <-> Rust memory sampler enforces MAX_RSS_MB (default 80). Set MAX_RSS_MB=0
+  to disable the threshold.
 
 ## Timing and delay injection
 

@@ -15,6 +15,7 @@ CHUNK_SIZE="${CHUNK_SIZE:-16384}"
 RUNS="${RUNS:-1}"
 RUN_EXFIL="${RUN_EXFIL:-1}"
 RUN_DOWNLOAD="${RUN_DOWNLOAD:-1}"
+MIN_AVG_MIB_S="${MIN_AVG_MIB_S:-10}"
 NETEM_IFACE="${NETEM_IFACE:-lo}"
 NETEM_DELAY_MS="${NETEM_DELAY_MS:-}"
 NETEM_JITTER_MS="${NETEM_JITTER_MS:-}"
@@ -146,6 +147,91 @@ print(f"{label}: bytes={bytes_val} secs={elapsed:.3f} MiB/s={mib_s:.2f}")
 PY
 }
 
+enforce_min_avg() {
+  python3 - "$RUN_DIR" "$TRANSFER_BYTES" "$MIN_AVG_MIB_S" "$RUN_EXFIL" "$RUN_DOWNLOAD" <<'PY'
+import json
+import pathlib
+import sys
+
+run_dir = pathlib.Path(sys.argv[1])
+bytes_val = int(sys.argv[2])
+min_avg = float(sys.argv[3])
+run_exfil = int(sys.argv[4]) != 0
+run_download = int(sys.argv[5]) != 0
+
+def load_done(path: pathlib.Path):
+    try:
+        data = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in data:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") == "done":
+            return event
+    return None
+
+def e2e_mib_s(start_log: pathlib.Path, end_log: pathlib.Path):
+    start = load_done(start_log)
+    end = load_done(end_log)
+    if not start or not end:
+        return None
+    start_ts = start.get("first_payload_ts")
+    end_ts = end.get("last_payload_ts")
+    if start_ts is None or end_ts is None:
+        return None
+    elapsed = end_ts - start_ts
+    if elapsed <= 0:
+        return None
+    mib = bytes_val / (1024 * 1024)
+    return mib / elapsed
+
+def collect(case: str):
+    values = []
+    for path in run_dir.glob(f"**/{case}"):
+        if not path.is_dir():
+            continue
+        if case == "exfil":
+            start_log = path / "bench.jsonl"
+            end_log = path / "target.jsonl"
+        else:
+            start_log = path / "target.jsonl"
+            end_log = path / "bench.jsonl"
+        if start_log.exists() and end_log.exists():
+            rate = e2e_mib_s(start_log, end_log)
+            if rate is not None:
+                values.append(rate)
+    return values
+
+failed = False
+if run_exfil:
+    exfil_rates = collect("exfil")
+    if not exfil_rates:
+        print("exfil avg: missing timing data")
+        failed = True
+    else:
+        exfil_avg = sum(exfil_rates) / len(exfil_rates)
+        print(f"exfil avg MiB/s: {exfil_avg:.2f} (min {min_avg:.2f})")
+        if exfil_avg < min_avg:
+            failed = True
+
+if run_download:
+    download_rates = collect("download")
+    if not download_rates:
+        print("download avg: missing timing data")
+        failed = True
+    else:
+        download_avg = sum(download_rates) / len(download_rates)
+        print(f"download avg MiB/s: {download_avg:.2f} (min {min_avg:.2f})")
+        if download_avg < min_avg:
+            failed = True
+
+raise SystemExit(1 if failed else 0)
+PY
+}
+
 cargo build -p slipstream-server -p slipstream-client --release
 
 run_case() {
@@ -271,4 +357,5 @@ else
   done
 fi
 
+enforce_min_avg
 echo "Benchmarks OK; logs in ${RUN_DIR}."

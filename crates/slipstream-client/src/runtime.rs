@@ -233,6 +233,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let packet_loop_recv_max = loop_burst_total(&resolvers, PICOQUIC_PACKET_LOOP_RECV_MAX);
         let mut zero_send_loops = 0u64;
         let mut zero_send_with_streams = 0u64;
+        let mut data_ready_skips = 0u64;
         let mut last_flow_block_log_at = 0u64;
 
         loop {
@@ -311,7 +312,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             let timeout = Duration::from_micros(timeout_us);
 
             if data_ready.swap(false, Ordering::Acquire) {
-                // Readers signalled data — skip select, go straight to drain.
+                data_ready_skips = data_ready_skips.saturating_add(1);
             } else {
                 let notified = data_notify.notified();
                 tokio::pin!(notified);
@@ -466,7 +467,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         now.saturating_sub(last_enqueue_at) / 1_000
                     };
                     error!(
-                        "connection flow blocked: streams={} streams_with_rx_queued={} queued_bytes_total={} streams_with_recv_fin={} streams_with_send_fin={} streams_discarding={} streams_with_unconsumed_rx={} enqueued_bytes={} last_enqueue_ms={} zero_send_with_streams={} zero_send_loops={} flow_blocked={} has_ready_stream={} backlog={:?}",
+                        "connection flow blocked: streams={} streams_with_rx_queued={} queued_bytes_total={} streams_with_recv_fin={} streams_with_send_fin={} streams_discarding={} streams_with_unconsumed_rx={} enqueued_bytes={} last_enqueue_ms={} zero_send_with_streams={} zero_send_loops={} data_ready_skips={} flow_blocked={} has_ready_stream={} backlog={:?}",
                         streams_len,
                         metrics.streams_with_rx_queued,
                         metrics.queued_bytes_total,
@@ -478,6 +479,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         last_enqueue_ms,
                         zero_send_with_streams,
                         zero_send_loops,
+                        data_ready_skips,
                         flow_blocked,
                         has_ready_stream,
                         backlog
@@ -578,6 +580,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 resolver.debug.last_enqueue_at = last_enqueue_at;
                 resolver.debug.zero_send_loops = zero_send_loops;
                 resolver.debug.zero_send_with_streams = zero_send_with_streams;
+                resolver.debug.data_ready_skips = data_ready_skips;
                 if !refresh_resolver_path(cnx, resolver) {
                     continue;
                 }

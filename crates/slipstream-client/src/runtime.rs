@@ -36,6 +36,7 @@ use slipstream_ffi::{
 };
 use std::ffi::CString;
 use std::net::Ipv6Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -50,6 +51,7 @@ const DNS_POLL_SLICE_US: u64 = 50_000;
 const RECONNECT_SLEEP_MIN_MS: u64 = 250;
 const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
+const MIN_POLL_INTERVAL_US: u64 = 100;
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -75,6 +77,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let data_notify = Arc::new(Notify::new());
+    let data_ready = Arc::new(AtomicBool::new(false));
     let acceptor = ClientAcceptor::new();
     let debug_streams = config.debug_streams;
     let tcp_host = config.tcp_listen_host;
@@ -122,6 +125,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     let mut state = Box::new(ClientState::new(
         command_tx,
         data_notify.clone(),
+        data_ready.clone(),
         debug_streams,
         acceptor,
     ));
@@ -300,52 +304,60 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             }
             // Avoid a tight poll loop when idle, but keep the short slice during active transfers.
             let timeout_us = if has_work {
-                delay_us.clamp(1, DNS_POLL_SLICE_US)
+                delay_us.clamp(MIN_POLL_INTERVAL_US, DNS_POLL_SLICE_US)
             } else {
-                delay_us.max(1)
+                delay_us.max(MIN_POLL_INTERVAL_US)
             };
             let timeout = Duration::from_micros(timeout_us);
 
-            tokio::select! {
-                command = command_rx.recv() => {
-                    if let Some(command) = command {
-                        handle_command(cnx, state_ptr, command);
+            if data_ready.swap(false, Ordering::Acquire) {
+                // Readers signalled data — skip select, go straight to drain.
+            } else {
+                let notified = data_notify.notified();
+                tokio::pin!(notified);
+                tokio::select! {
+                    command = command_rx.recv() => {
+                        if let Some(command) = command {
+                            handle_command(cnx, state_ptr, command);
+                        }
                     }
-                }
-                _ = data_notify.notified() => {}
-                recv = udp.recv_from(&mut recv_buf) => {
-                    match recv {
-                        Ok((size, peer)) => {
-                            let mut response_ctx = DnsResponseContext {
-                                quic,
-                                local_addr_storage: &local_addr_storage,
-                                resolvers: &mut resolvers,
-                            };
-                            handle_dns_response(&recv_buf[..size], peer, &mut response_ctx)?;
-                            for _ in 1..packet_loop_recv_max {
-                                match udp.try_recv_from(&mut recv_buf) {
-                                    Ok((size, peer)) => {
-                                        handle_dns_response(&recv_buf[..size], peer, &mut response_ctx)?;
-                                    }
-                                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                                    Err(err) => {
-                                        if is_transient_udp_error(&err) {
-                                            break;
+                    _ = &mut notified => {
+                        data_ready.swap(false, Ordering::Acquire);
+                    }
+                    recv = udp.recv_from(&mut recv_buf) => {
+                        match recv {
+                            Ok((size, peer)) => {
+                                let mut response_ctx = DnsResponseContext {
+                                    quic,
+                                    local_addr_storage: &local_addr_storage,
+                                    resolvers: &mut resolvers,
+                                };
+                                handle_dns_response(&recv_buf[..size], peer, &mut response_ctx)?;
+                                for _ in 1..packet_loop_recv_max {
+                                    match udp.try_recv_from(&mut recv_buf) {
+                                        Ok((size, peer)) => {
+                                            handle_dns_response(&recv_buf[..size], peer, &mut response_ctx)?;
                                         }
-                                        return Err(map_io(err));
+                                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                                        Err(err) => {
+                                            if is_transient_udp_error(&err) {
+                                                break;
+                                            }
+                                            return Err(map_io(err));
+                                        }
                                     }
                                 }
                             }
-                        }
-                        Err(err) => {
-                            if !is_transient_udp_error(&err) {
-                                return Err(map_io(err));
+                            Err(err) => {
+                                if !is_transient_udp_error(&err) {
+                                    return Err(map_io(err));
+                                }
                             }
                         }
                     }
+                    _ = sleep(timeout) => {}
                 }
-                _ = sleep(timeout) => {}
             }
 
             drain_commands(cnx, state_ptr, &mut command_rx);

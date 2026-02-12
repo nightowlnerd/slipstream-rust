@@ -13,6 +13,7 @@ use slipstream_ffi::picoquic::{
 };
 use slipstream_ffi::{abort_stream_bidi, SLIPSTREAM_FILE_CANCEL_ERROR, SLIPSTREAM_INTERNAL_ERROR};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream as TokioTcpStream;
@@ -31,6 +32,7 @@ pub(crate) struct ClientState {
     multi_stream_mode: bool,
     command_tx: mpsc::UnboundedSender<Command>,
     data_notify: Arc<Notify>,
+    data_ready: Arc<AtomicBool>,
     path_events: Vec<PathEvent>,
     debug_streams: bool,
     acceptor: acceptor::ClientAcceptor,
@@ -432,6 +434,7 @@ impl ClientState {
     pub(crate) fn new(
         command_tx: mpsc::UnboundedSender<Command>,
         data_notify: Arc<Notify>,
+        data_ready: Arc<AtomicBool>,
         debug_streams: bool,
         acceptor: acceptor::ClientAcceptor,
     ) -> Self {
@@ -442,6 +445,7 @@ impl ClientState {
             multi_stream_mode: false,
             command_tx,
             data_notify,
+            data_ready,
             path_events: Vec::new(),
             debug_streams,
             acceptor,
@@ -958,7 +962,13 @@ mod tests {
         let (command_tx, _command_rx) = mpsc::unbounded_channel();
         let data_notify = Arc::new(Notify::new());
         let acceptor = acceptor::ClientAcceptor::new();
-        let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+        let mut state = ClientState::new(
+            command_tx,
+            data_notify,
+            Arc::new(AtomicBool::new(false)),
+            false,
+            acceptor,
+        );
         let stream_id = 4;
         let (write_tx, _write_rx) = mpsc::unbounded_channel();
         let (read_abort_tx, _read_abort_rx) = oneshot::channel();
@@ -995,7 +1005,13 @@ mod tests {
         let (command_tx, _command_rx) = mpsc::unbounded_channel();
         let data_notify = Arc::new(Notify::new());
         let acceptor = acceptor::ClientAcceptor::new();
-        let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+        let mut state = ClientState::new(
+            command_tx,
+            data_notify,
+            Arc::new(AtomicBool::new(false)),
+            false,
+            acceptor,
+        );
         let stream_id = 4;
         let (write_tx, mut write_rx) = mpsc::unbounded_channel();
         let (read_abort_tx, _read_abort_rx) = oneshot::channel();
@@ -1037,7 +1053,13 @@ mod tests {
         let (command_tx, _command_rx) = mpsc::unbounded_channel();
         let data_notify = Arc::new(Notify::new());
         let acceptor = acceptor::ClientAcceptor::new();
-        let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+        let mut state = ClientState::new(
+            command_tx,
+            data_notify,
+            Arc::new(AtomicBool::new(false)),
+            false,
+            acceptor,
+        );
         let stream_id = 4;
         let (write_tx, _write_rx) = mpsc::unbounded_channel();
         let (read_abort_tx, _read_abort_rx) = oneshot::channel();
@@ -1084,7 +1106,13 @@ mod tests {
         let (command_tx, _command_rx) = mpsc::unbounded_channel();
         let data_notify = Arc::new(Notify::new());
         let acceptor = acceptor::ClientAcceptor::new();
-        let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+        let mut state = ClientState::new(
+            command_tx,
+            data_notify,
+            Arc::new(AtomicBool::new(false)),
+            false,
+            acceptor,
+        );
         let stream_id = 4;
         let (write_tx, _write_rx) = mpsc::unbounded_channel();
         let (read_abort_tx, _read_abort_rx) = oneshot::channel();
@@ -1142,7 +1170,13 @@ mod tests {
             let data_notify = Arc::new(Notify::new());
             let acceptor = acceptor::ClientAcceptor::new();
             let reservation = acceptor.reserve_for_test().await;
-            let mut state = ClientState::new(command_tx, data_notify, false, acceptor);
+            let mut state = ClientState::new(
+                command_tx,
+                data_notify,
+                Arc::new(AtomicBool::new(false)),
+                false,
+                acceptor,
+            );
 
             test_hooks::set_mark_active_stream_failures(1);
 
@@ -1303,6 +1337,7 @@ pub(crate) fn handle_command(
             );
             let (data_tx, data_rx) = mpsc::channel(read_limit);
             let data_notify = state.data_notify.clone();
+            let data_ready = state.data_ready.clone();
             let send_buffer_bytes = tcp_send_buffer_bytes(&stream)
                 .filter(|bytes| *bytes > 0)
                 .unwrap_or(CLIENT_WRITE_COALESCE_DEFAULT_BYTES);
@@ -1329,6 +1364,7 @@ pub(crate) fn handle_command(
                 command_tx.clone(),
                 data_tx,
                 data_notify,
+                data_ready,
             );
             spawn_client_writer(
                 stream_id,
@@ -1515,6 +1551,7 @@ fn spawn_client_reader(
     command_tx: mpsc::UnboundedSender<Command>,
     data_tx: mpsc::Sender<Vec<u8>>,
     data_notify: Arc<Notify>,
+    data_ready: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; STREAM_READ_CHUNK_BYTES];
@@ -1533,6 +1570,7 @@ fn spawn_client_reader(
                             if data_tx.send(data).await.is_err() {
                                 break;
                             }
+                            data_ready.store(true, Ordering::Release);
                             data_notify.notify_one();
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
@@ -1547,6 +1585,7 @@ fn spawn_client_reader(
             }
         }
         drop(data_tx);
+        data_ready.store(true, Ordering::Release);
         data_notify.notify_one();
     });
 }

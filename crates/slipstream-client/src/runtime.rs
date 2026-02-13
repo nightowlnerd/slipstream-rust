@@ -216,7 +216,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             picoquic_set_callback(cnx, Some(client_callback), state_ptr as *mut _);
             picoquic_enable_path_callbacks(cnx, 1);
             if config.keep_alive_interval > 0 {
-                picoquic_enable_keep_alive(cnx, config.keep_alive_interval as u64 * 1000);
+                // Pass 0 to let picoquic auto-calculate as idle_timeout / 2,
+                // ensuring keep-alive always fires before the connection times out.
+                picoquic_enable_keep_alive(cnx, 0);
             } else {
                 picoquic_disable_keep_alive(cnx);
             }

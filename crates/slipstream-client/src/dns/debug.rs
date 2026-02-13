@@ -11,6 +11,7 @@ pub(crate) struct DebugMetrics {
     pub(crate) dns_responses: u64,
     pub(crate) zero_send_loops: u64,
     pub(crate) zero_send_with_streams: u64,
+    pub(crate) data_ready_skips: u64,
     pub(crate) enqueued_bytes: u64,
     pub(crate) send_packets: u64,
     pub(crate) send_bytes: u64,
@@ -19,6 +20,7 @@ pub(crate) struct DebugMetrics {
     pub(crate) last_report_dns: u64,
     pub(crate) last_report_zero: u64,
     pub(crate) last_report_zero_streams: u64,
+    pub(crate) last_report_data_ready_skips: u64,
     pub(crate) last_report_enqueued: u64,
     pub(crate) last_report_send_packets: u64,
     pub(crate) last_report_send_bytes: u64,
@@ -33,6 +35,7 @@ impl DebugMetrics {
             dns_responses: 0,
             zero_send_loops: 0,
             zero_send_with_streams: 0,
+            data_ready_skips: 0,
             enqueued_bytes: 0,
             send_packets: 0,
             send_bytes: 0,
@@ -41,6 +44,7 @@ impl DebugMetrics {
             last_report_dns: 0,
             last_report_zero: 0,
             last_report_zero_streams: 0,
+            last_report_data_ready_skips: 0,
             last_report_enqueued: 0,
             last_report_send_packets: 0,
             last_report_send_bytes: 0,
@@ -75,6 +79,9 @@ pub(crate) fn maybe_report_debug(
     let zero_stream_delta = debug
         .zero_send_with_streams
         .saturating_sub(debug.last_report_zero_streams);
+    let data_ready_delta = debug
+        .data_ready_skips
+        .saturating_sub(debug.last_report_data_ready_skips);
     let enq_delta = debug
         .enqueued_bytes
         .saturating_sub(debug.last_report_enqueued);
@@ -99,7 +106,7 @@ pub(crate) fn maybe_report_debug(
         String::new()
     };
     debug!(
-        "debug: {} dns+={} send_pkts+={} send_bytes+={} polls+={} zero_send+={} zero_send_streams+={} streams={} enqueued+={} last_enqueue_ms={} pending_polls={} inflight_polls={}{}",
+        "debug: {} dns+={} send_pkts+={} send_bytes+={} polls+={} zero_send+={} zero_send_streams+={} data_ready_skips+={} streams={} enqueued+={} last_enqueue_ms={} pending_polls={} inflight_polls={}{}",
         label,
         dns_delta,
         send_pkt_delta,
@@ -107,6 +114,7 @@ pub(crate) fn maybe_report_debug(
         polls_delta,
         zero_delta,
         zero_stream_delta,
+        data_ready_delta,
         streams_len,
         enq_delta,
         enqueue_ms,
@@ -118,6 +126,7 @@ pub(crate) fn maybe_report_debug(
     debug.last_report_dns = debug.dns_responses;
     debug.last_report_zero = debug.zero_send_loops;
     debug.last_report_zero_streams = debug.zero_send_with_streams;
+    debug.last_report_data_ready_skips = debug.data_ready_skips;
     debug.last_report_enqueued = debug.enqueued_bytes;
     debug.last_report_send_packets = debug.send_packets;
     debug.last_report_send_bytes = debug.send_bytes;

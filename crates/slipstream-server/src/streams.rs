@@ -13,6 +13,7 @@ use slipstream_ffi::picoquic::{
     picoquic_current_time, picoquic_get_first_cnx, picoquic_get_next_cnx,
     picoquic_mark_active_stream, picoquic_provide_stream_data_buffer, picoquic_quic_t,
     picoquic_reset_stream, picoquic_stop_sending, picoquic_stream_data_consumed,
+    slipstream_is_stream_send_closed,
 };
 use slipstream_ffi::{abort_stream_bidi, SLIPSTREAM_FILE_CANCEL_ERROR, SLIPSTREAM_INTERNAL_ERROR};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -200,6 +201,16 @@ impl ServerState {
         let mut remarked = 0;
         let mut cleaned = 0;
         for sid in stalled {
+            // Skip streams where picoquic already has FIN/RESET set.
+            if unsafe { slipstream_is_stream_send_closed(cnx, sid) } != 0 {
+                let key = StreamKey {
+                    cnx: cnx_id,
+                    stream_id: sid,
+                };
+                shutdown_stream(self, key);
+                cleaned += 1;
+                continue;
+            }
             let ret = unsafe { picoquic_mark_active_stream(cnx, sid, 1, std::ptr::null_mut()) };
             if ret == 0 {
                 remarked += 1;
@@ -943,67 +954,75 @@ pub(crate) fn handle_command(state_ptr: *mut ServerState, command: Command) {
                         stream_id, stream.tx_bytes
                     );
                 }
-                // If data_rx is already None, prepare_to_send detected the channel
-                // disconnect and already sent (or is sending) the FIN. Skip re-marking
-                // to avoid a 1060 error from picoquic (fin_requested already set).
-                if stream.data_rx.is_none() {
-                    check_stream_invariants(state, key, "StreamClosed");
-                    return;
-                }
-                if let Some(pending) = stream.send_pending.as_ref() {
-                    pending.store(true, Ordering::SeqCst);
-                }
                 let cnx = cnx_id as *mut picoquic_cnx_t;
-                #[cfg(test)]
-                let ret = if forced_failure {
-                    test_hooks::FORCED_MARK_ACTIVE_STREAM_ERROR
-                } else {
-                    assert!(
-                        cnx_id >= 0x1000,
-                        "mark_active_stream called with synthetic cnx_id; set test failure counter"
-                    );
-                    unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) }
-                };
+                // Check if picoquic already has FIN or RESET on this stream
+                // (e.g. prepare_to_send sent the FIN in an earlier callback).
+                // Calling mark_active_stream would return 1060 in that case.
                 #[cfg(not(test))]
-                let ret =
-                    unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) };
-                if ret != 0 {
-                    const MARK_ACTIVE_FAIL_LOG_INTERVAL_US: u64 = 1_000_000;
-                    let now = unsafe { picoquic_current_time() };
-                    if now.saturating_sub(state.last_mark_active_fail_log_at)
-                        >= MARK_ACTIVE_FAIL_LOG_INTERVAL_US
-                    {
-                        let send_pending = stream
-                            .send_pending
-                            .as_ref()
-                            .map(|pending| pending.load(Ordering::SeqCst))
-                            .unwrap_or(false);
-                        let send_stash_bytes = stream
-                            .send_stash
-                            .as_ref()
-                            .map(|stash| stash.len())
-                            .unwrap_or(0);
-                        let backlog = BacklogStreamSummary {
-                            stream_id,
-                            send_pending,
-                            send_stash_bytes,
-                            target_fin_pending: stream.target_fin_pending,
-                            close_after_flush: stream.close_after_flush,
-                            pending_fin: stream.pending_fin,
-                            fin_enqueued: stream.fin_enqueued,
-                            queued_bytes: stream.flow.queued_bytes as u64,
-                            pending_chunks: stream.pending_data.len(),
-                        };
-                        warn!(
-                            "stream {:?}: mark_active_stream fin failed ret={} backlog={:?}",
-                            stream_id, ret, backlog
-                        );
-                        state.last_mark_active_fail_log_at = now;
-                    }
-                    if !forced_failure && !is_terminal_mark_error(ret) {
-                        unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
-                    }
+                let already_closed =
+                    unsafe { slipstream_is_stream_send_closed(cnx, stream_id) } != 0;
+                #[cfg(test)]
+                let already_closed = false;
+                if already_closed {
                     remove_stream = true;
+                } else {
+                    if let Some(pending) = stream.send_pending.as_ref() {
+                        pending.store(true, Ordering::SeqCst);
+                    }
+                    #[cfg(test)]
+                    let ret = if forced_failure {
+                        test_hooks::FORCED_MARK_ACTIVE_STREAM_ERROR
+                    } else {
+                        assert!(
+                            cnx_id >= 0x1000,
+                            "mark_active_stream called with synthetic cnx_id; set test failure counter"
+                        );
+                        unsafe {
+                            picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut())
+                        }
+                    };
+                    #[cfg(not(test))]
+                    let ret = unsafe {
+                        picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut())
+                    };
+                    if ret != 0 {
+                        const MARK_ACTIVE_FAIL_LOG_INTERVAL_US: u64 = 1_000_000;
+                        let now = unsafe { picoquic_current_time() };
+                        if now.saturating_sub(state.last_mark_active_fail_log_at)
+                            >= MARK_ACTIVE_FAIL_LOG_INTERVAL_US
+                        {
+                            let send_pending = stream
+                                .send_pending
+                                .as_ref()
+                                .map(|pending| pending.load(Ordering::SeqCst))
+                                .unwrap_or(false);
+                            let send_stash_bytes = stream
+                                .send_stash
+                                .as_ref()
+                                .map(|stash| stash.len())
+                                .unwrap_or(0);
+                            let backlog = BacklogStreamSummary {
+                                stream_id,
+                                send_pending,
+                                send_stash_bytes,
+                                target_fin_pending: stream.target_fin_pending,
+                                close_after_flush: stream.close_after_flush,
+                                pending_fin: stream.pending_fin,
+                                fin_enqueued: stream.fin_enqueued,
+                                queued_bytes: stream.flow.queued_bytes as u64,
+                                pending_chunks: stream.pending_data.len(),
+                            };
+                            warn!(
+                                "stream {:?}: mark_active_stream fin failed ret={} backlog={:?}",
+                                stream_id, ret, backlog
+                            );
+                            state.last_mark_active_fail_log_at = now;
+                        }
+                        if !forced_failure && !is_terminal_mark_error(ret) {
+                            unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+                        }
+                        remove_stream = true;
+                    }
                 }
             }
             if remove_stream {
@@ -1024,39 +1043,48 @@ pub(crate) fn handle_command(state_ptr: *mut ServerState, command: Command) {
             #[cfg(not(test))]
             let forced_failure = false;
             let cnx = cnx_id as *mut picoquic_cnx_t;
-            #[cfg(test)]
-            let ret = if forced_failure {
-                test_hooks::FORCED_MARK_ACTIVE_STREAM_ERROR
-            } else {
-                assert!(
-                    cnx_id >= 0x1000,
-                    "mark_active_stream called with synthetic cnx_id; set test failure counter"
-                );
-                unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) }
-            };
             #[cfg(not(test))]
-            let ret =
-                unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) };
-            if ret != 0 {
-                if let Some(stream) = shutdown_stream(state, key) {
-                    warn!(
-                        "stream {:?}: mark_active_stream readable failed ret={} tx_bytes={} rx_bytes={} consumed_offset={} queued={} fin_offset={:?}",
-                        stream_id,
-                        ret,
-                        stream.tx_bytes,
-                        stream.flow.rx_bytes,
-                        stream.flow.consumed_offset,
-                        stream.flow.queued_bytes,
-                        stream.flow.fin_offset
+            let already_closed = unsafe { slipstream_is_stream_send_closed(cnx, stream_id) } != 0;
+            #[cfg(test)]
+            let already_closed = false;
+            if already_closed {
+                // Stream already has FIN/RESET in picoquic; just clean up.
+                shutdown_stream(state, key);
+            } else {
+                #[cfg(test)]
+                let ret = if forced_failure {
+                    test_hooks::FORCED_MARK_ACTIVE_STREAM_ERROR
+                } else {
+                    assert!(
+                        cnx_id >= 0x1000,
+                        "mark_active_stream called with synthetic cnx_id; set test failure counter"
                     );
-                    if !forced_failure && !is_terminal_mark_error(ret) {
-                        unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+                    unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) }
+                };
+                #[cfg(not(test))]
+                let ret =
+                    unsafe { picoquic_mark_active_stream(cnx, stream_id, 1, std::ptr::null_mut()) };
+                if ret != 0 {
+                    if let Some(stream) = shutdown_stream(state, key) {
+                        warn!(
+                            "stream {:?}: mark_active_stream readable failed ret={} tx_bytes={} rx_bytes={} consumed_offset={} queued={} fin_offset={:?}",
+                            stream_id,
+                            ret,
+                            stream.tx_bytes,
+                            stream.flow.rx_bytes,
+                            stream.flow.consumed_offset,
+                            stream.flow.queued_bytes,
+                            stream.flow.fin_offset
+                        );
+                        if !forced_failure && !is_terminal_mark_error(ret) {
+                            unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
+                        }
+                    } else if state.debug_streams {
+                        debug!(
+                            "stream {:?}: mark_active_stream readable failed ret={}",
+                            stream_id, ret
+                        );
                     }
-                } else if state.debug_streams {
-                    debug!(
-                        "stream {:?}: mark_active_stream readable failed ret={}",
-                        stream_id, ret
-                    );
                 }
             }
         }

@@ -943,6 +943,13 @@ pub(crate) fn handle_command(state_ptr: *mut ServerState, command: Command) {
                         stream_id, stream.tx_bytes
                     );
                 }
+                // If data_rx is already None, prepare_to_send detected the channel
+                // disconnect and already sent (or is sending) the FIN. Skip re-marking
+                // to avoid a 1060 error from picoquic (fin_requested already set).
+                if stream.data_rx.is_none() {
+                    check_stream_invariants(state, key, "StreamClosed");
+                    return;
+                }
                 if let Some(pending) = stream.send_pending.as_ref() {
                     pending.store(true, Ordering::SeqCst);
                 }
@@ -1213,12 +1220,13 @@ mod tests {
             stream_id: 4,
         };
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let (_data_tx, data_rx) = mpsc::channel(1);
 
         state.streams.insert(
             key,
             ServerStream {
                 write_tx: None,
-                data_rx: None,
+                data_rx: Some(data_rx),
                 send_pending: Some(Arc::new(AtomicBool::new(false))),
                 send_stash: None,
                 shutdown_tx,

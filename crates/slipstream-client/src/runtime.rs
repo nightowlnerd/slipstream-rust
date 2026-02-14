@@ -37,7 +37,7 @@ use slipstream_ffi::{
 };
 use std::ffi::CString;
 use std::net::Ipv6Addr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -69,13 +69,45 @@ const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// the watchdog aborts the process so systemd can restart it.
 struct Watchdog {
     heartbeat: Arc<AtomicU64>,
+    phase: Arc<AtomicU32>,
     _handle: std::thread::JoinHandle<()>,
+}
+
+// Phase constants — identify which section of the main loop is executing.
+// When the watchdog fires, the phase tells us exactly where the hang is.
+const PHASE_DRAIN_COMMANDS: u32 = 1;
+const PHASE_DRAIN_STREAM_DATA: u32 = 2;
+const PHASE_CNX_STATE_CHECK: u32 = 3;
+const PHASE_WAKE_DELAY: u32 = 4;
+const PHASE_SELECT: u32 = 5;
+const PHASE_POST_DRAIN: u32 = 6;
+const PHASE_PREPARE_PACKET: u32 = 7;
+const PHASE_SEND_DNS: u32 = 8;
+const PHASE_POLL_QUERIES: u32 = 9;
+const PHASE_HEALTH_LOG: u32 = 10;
+
+fn phase_name(phase: u32) -> &'static str {
+    match phase {
+        PHASE_DRAIN_COMMANDS => "drain_commands",
+        PHASE_DRAIN_STREAM_DATA => "drain_stream_data",
+        PHASE_CNX_STATE_CHECK => "cnx_state_check",
+        PHASE_WAKE_DELAY => "wake_delay",
+        PHASE_SELECT => "select/sleep",
+        PHASE_POST_DRAIN => "post_select_drain",
+        PHASE_PREPARE_PACKET => "prepare_next_packet_ex",
+        PHASE_SEND_DNS => "send_dns_query",
+        PHASE_POLL_QUERIES => "send_poll_queries",
+        PHASE_HEALTH_LOG => "health_log",
+        _ => "unknown",
+    }
 }
 
 impl Watchdog {
     fn spawn() -> Self {
         let heartbeat = Arc::new(AtomicU64::new(0));
+        let phase = Arc::new(AtomicU32::new(0));
         let hb = Arc::clone(&heartbeat);
+        let ph = Arc::clone(&phase);
         let handle = std::thread::Builder::new()
             .name("watchdog".into())
             .spawn(move || loop {
@@ -87,9 +119,12 @@ impl Watchdog {
                 let now = unsafe { picoquic_current_time() };
                 let stale_us = now.saturating_sub(ts);
                 if stale_us > WATCHDOG_STALE_SECS * 1_000_000 {
+                    let stuck_phase = ph.load(Ordering::Relaxed);
                     eprintln!(
-                        "WATCHDOG: main loop stalled for {:.1}s, aborting process",
-                        stale_us as f64 / 1_000_000.0
+                        "WATCHDOG: main loop stalled for {:.1}s at phase {} ({}), aborting process",
+                        stale_us as f64 / 1_000_000.0,
+                        stuck_phase,
+                        phase_name(stuck_phase),
                     );
                     std::process::abort();
                 }
@@ -97,6 +132,7 @@ impl Watchdog {
             .expect("failed to spawn watchdog thread");
         Self {
             heartbeat,
+            phase,
             _handle: handle,
         }
     }
@@ -104,6 +140,10 @@ impl Watchdog {
     fn pet(&self) {
         let now = unsafe { picoquic_current_time() };
         self.heartbeat.store(now, Ordering::Relaxed);
+    }
+
+    fn set_phase(&self, p: u32) {
+        self.phase.store(p, Ordering::Relaxed);
     }
 }
 
@@ -303,8 +343,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
         loop {
             watchdog.pet();
+            watchdog.set_phase(PHASE_DRAIN_COMMANDS);
             let current_time = unsafe { picoquic_current_time() };
             drain_commands(cnx, state_ptr, &mut command_rx);
+            watchdog.set_phase(PHASE_DRAIN_STREAM_DATA);
             drain_stream_data(cnx, state_ptr);
             let closing = unsafe { (*state_ptr).is_closing() };
             if closing {
@@ -312,6 +354,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             }
 
             // Detect broken QUIC connection state that the callback missed.
+            watchdog.set_phase(PHASE_CNX_STATE_CHECK);
             let cnx_state = unsafe { picoquic_get_cnx_state(cnx) };
             if cnx_state as u32 >= picoquic_state_enum::picoquic_state_disconnecting as u32 {
                 warn!(
@@ -347,6 +390,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
 
+            watchdog.set_phase(PHASE_WAKE_DELAY);
             let delay_us =
                 unsafe { picoquic_get_next_wake_delay(quic, current_time, DNS_WAKE_DELAY_MAX_US) };
             let delay_us = if delay_us < 0 { 0 } else { delay_us as u64 };
@@ -390,6 +434,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             };
             let timeout = Duration::from_micros(timeout_us);
 
+            watchdog.set_phase(PHASE_SELECT);
             if data_ready.swap(false, Ordering::Acquire) {
                 data_ready_skips = data_ready_skips.saturating_add(1);
             } else {
@@ -441,12 +486,14 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
 
+            watchdog.set_phase(PHASE_POST_DRAIN);
             drain_commands(cnx, state_ptr, &mut command_rx);
             drain_stream_data(cnx, state_ptr);
             drain_path_events(cnx, &mut resolvers, state_ptr);
 
             let mut sent_quic_data = false;
             for _ in 0..packet_loop_send_max {
+                watchdog.set_phase(PHASE_PREPARE_PACKET);
                 let current_time = unsafe { picoquic_current_time() };
                 let mut send_length: libc::size_t = 0;
                 let mut addr_to: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -508,6 +555,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     }
                 }
 
+                watchdog.set_phase(PHASE_SEND_DNS);
                 let qname = build_qname(&send_buf[..send_length], config.domain)
                     .map_err(|err| ClientError::new(err.to_string()))?;
                 let params = QueryParams {
@@ -570,6 +618,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     last_flow_block_log_at = now;
                 }
             }
+            watchdog.set_phase(PHASE_POLL_QUERIES);
             for resolver in resolvers.iter_mut() {
                 if !refresh_resolver_path(cnx, resolver) {
                     continue;
@@ -716,6 +765,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
             // Periodic health heartbeat: log key metrics at INFO level so we
             // can diagnose silent tunnel deaths from production logs.
+            watchdog.set_phase(PHASE_HEALTH_LOG);
             if ready && report_time.saturating_sub(last_health_log_at) >= HEALTH_LOG_INTERVAL_US {
                 last_health_log_at = report_time;
                 let (acceptor_used, acceptor_max) = unsafe { (*state_ptr).acceptor_metrics() };

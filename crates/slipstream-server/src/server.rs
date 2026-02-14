@@ -19,7 +19,7 @@ use std::ffi::CString;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{lookup_host, UdpSocket as TokioUdpSocket};
@@ -54,13 +54,37 @@ static SHOULD_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// the watchdog aborts the process so systemd can restart it.
 pub(crate) struct Watchdog {
     heartbeat: Arc<AtomicU64>,
+    phase: Arc<AtomicU32>,
     _handle: std::thread::JoinHandle<()>,
+}
+
+const S_PHASE_DRAIN_COMMANDS: u32 = 1;
+const S_PHASE_RECV: u32 = 2;
+const S_PHASE_HANDLE_PACKET: u32 = 3;
+const S_PHASE_PREPARE_PACKET: u32 = 4;
+const S_PHASE_SEND_RESPONSE: u32 = 5;
+const S_PHASE_IDLE_GC: u32 = 6;
+const S_PHASE_HEALTH_LOG: u32 = 7;
+
+fn server_phase_name(phase: u32) -> &'static str {
+    match phase {
+        S_PHASE_DRAIN_COMMANDS => "drain_commands",
+        S_PHASE_RECV => "udp_recv",
+        S_PHASE_HANDLE_PACKET => "handle_packet",
+        S_PHASE_PREPARE_PACKET => "prepare_packet_ex",
+        S_PHASE_SEND_RESPONSE => "send_dns_response",
+        S_PHASE_IDLE_GC => "idle_gc",
+        S_PHASE_HEALTH_LOG => "health_log",
+        _ => "unknown",
+    }
 }
 
 impl Watchdog {
     pub(crate) fn spawn() -> Self {
         let heartbeat = Arc::new(AtomicU64::new(0));
+        let phase = Arc::new(AtomicU32::new(0));
         let hb = Arc::clone(&heartbeat);
+        let ph = Arc::clone(&phase);
         let handle = std::thread::Builder::new()
             .name("watchdog".into())
             .spawn(move || {
@@ -74,9 +98,12 @@ impl Watchdog {
                     let now = unsafe { picoquic_current_time() };
                     let stale_us = now.saturating_sub(ts);
                     if stale_us > WATCHDOG_STALE_SECS * 1_000_000 {
+                        let stuck_phase = ph.load(Ordering::Relaxed);
                         eprintln!(
-                            "WATCHDOG: main loop stalled for {:.1}s, aborting process",
-                            stale_us as f64 / 1_000_000.0
+                            "WATCHDOG: main loop stalled for {:.1}s at phase {} ({}), aborting process",
+                            stale_us as f64 / 1_000_000.0,
+                            stuck_phase,
+                            server_phase_name(stuck_phase),
                         );
                         std::process::abort();
                     }
@@ -85,6 +112,7 @@ impl Watchdog {
             .expect("failed to spawn watchdog thread");
         Self {
             heartbeat,
+            phase,
             _handle: handle,
         }
     }
@@ -92,6 +120,10 @@ impl Watchdog {
     pub(crate) fn pet(&self) {
         let now = unsafe { picoquic_current_time() };
         self.heartbeat.store(now, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_phase(&self, p: u32) {
+        self.phase.store(p, Ordering::Relaxed);
     }
 }
 
@@ -337,6 +369,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
 
     loop {
         watchdog.pet();
+        watchdog.set_phase(S_PHASE_DRAIN_COMMANDS);
         drain_commands(state_ptr, &mut command_rx);
 
         if SHOULD_SHUTDOWN.load(Ordering::Relaxed) {
@@ -351,6 +384,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             manager.cleanup();
         }
 
+        watchdog.set_phase(S_PHASE_RECV);
         tokio::select! {
             command = command_rx.recv() => {
                 if let Some(command) = command {
@@ -408,6 +442,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             _ = sleep(Duration::from_millis(IDLE_SLEEP_MS)) => {}
         }
 
+        watchdog.set_phase(S_PHASE_IDLE_GC);
         let now = Instant::now();
         if idle_timeout != Duration::ZERO {
             note_active_connections(&mut last_seen, &slots, now);
@@ -424,6 +459,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
         drain_commands(state_ptr, &mut command_rx);
         maybe_report_command_stats(state_ptr);
 
+        watchdog.set_phase(S_PHASE_HEALTH_LOG);
         if now.duration_since(last_health_log) >= HEALTH_LOG_INTERVAL {
             last_health_log = now;
             let active = collect_active_connections(quic);
@@ -443,6 +479,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
         let loop_time = unsafe { picoquic_current_time() };
 
         for slot in slots.iter_mut() {
+            watchdog.set_phase(S_PHASE_PREPARE_PACKET);
             let mut send_length = 0usize;
             let mut addr_to: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut addr_from: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -533,6 +570,7 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
             } else {
                 (None, slot.rcode)
             };
+            watchdog.set_phase(S_PHASE_SEND_RESPONSE);
             let response = encode_response(&ResponseParams {
                 id: slot.id,
                 rd: slot.rd,

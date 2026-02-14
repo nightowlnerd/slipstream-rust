@@ -37,7 +37,7 @@ use slipstream_ffi::{
 };
 use std::ffi::CString;
 use std::net::Ipv6Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -60,6 +60,52 @@ const RESOLVER_STALL_TIMEOUT_US: u64 = 60_000_000;
 /// Periodic health heartbeat log interval (5 minutes).  Emits connection
 /// state at INFO level so we can diagnose silent tunnel deaths.
 const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
+const WATCHDOG_STALE_SECS: u64 = 30;
+const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Watchdog that runs on a separate OS thread (not tokio) to detect when the
+/// single-threaded tokio runtime freezes (e.g. a picoquic C FFI call hangs).
+/// If the main loop hasn't updated the heartbeat for WATCHDOG_STALE_SECS,
+/// the watchdog aborts the process so systemd can restart it.
+struct Watchdog {
+    heartbeat: Arc<AtomicU64>,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+impl Watchdog {
+    fn spawn() -> Self {
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let hb = Arc::clone(&heartbeat);
+        let handle = std::thread::Builder::new()
+            .name("watchdog".into())
+            .spawn(move || loop {
+                std::thread::sleep(WATCHDOG_CHECK_INTERVAL);
+                let ts = hb.load(Ordering::Relaxed);
+                if ts == 0 {
+                    continue;
+                }
+                let now = unsafe { picoquic_current_time() };
+                let stale_us = now.saturating_sub(ts);
+                if stale_us > WATCHDOG_STALE_SECS * 1_000_000 {
+                    eprintln!(
+                        "WATCHDOG: main loop stalled for {:.1}s, aborting process",
+                        stale_us as f64 / 1_000_000.0
+                    );
+                    std::process::abort();
+                }
+            })
+            .expect("failed to spawn watchdog thread");
+        Self {
+            heartbeat,
+            _handle: handle,
+        }
+    }
+
+    fn pet(&self) {
+        let now = unsafe { picoquic_current_time() };
+        self.heartbeat.store(now, Ordering::Relaxed);
+    }
+}
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -141,6 +187,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     let _state = state;
 
     let mut reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
+    let watchdog = Watchdog::spawn();
 
     loop {
         let mut resolvers = resolve_resolvers(config.resolvers, mtu, config.debug_poll)?;
@@ -255,6 +302,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut last_health_log_at = 0u64;
 
         loop {
+            watchdog.pet();
             let current_time = unsafe { picoquic_current_time() };
             drain_commands(cnx, state_ptr, &mut command_rx);
             drain_stream_data(cnx, state_ptr);
@@ -609,24 +657,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                             }
                         }
                     }
-                }
-            }
-
-            // Detect resolver stall: if we've been sending polls but getting
-            // no DNS responses for RESOLVER_STALL_TIMEOUT_US, the recursive
-            // resolver likely stopped forwarding.  Force a reconnect so the
-            // new QUIC handshake resets resolver state.
-            if last_recv_at > 0 && ready {
-                let stall_us = unsafe { picoquic_current_time() }.saturating_sub(last_recv_at);
-                if stall_us >= RESOLVER_STALL_TIMEOUT_US {
-                    let streams_len = unsafe { (*state_ptr).streams_len() };
-                    warn!(
-                        "resolver stall detected: no DNS responses for {:.1}s, streams={}, forcing reconnect",
-                        stall_us as f64 / 1_000_000.0,
-                        streams_len,
-                    );
-                    unsafe { picoquic_close(cnx, 0) };
-                    break;
                 }
             }
 

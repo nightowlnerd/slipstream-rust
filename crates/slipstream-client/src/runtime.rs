@@ -52,6 +52,10 @@ const RECONNECT_SLEEP_MIN_MS: u64 = 250;
 const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
 const MIN_POLL_INTERVAL_US: u64 = 100;
+/// Force a reconnect if no DNS responses arrive within this window while the
+/// connection is active.  This catches cases where the recursive resolver
+/// silently stops forwarding queries (rate-limit, anti-tunnel heuristic, etc.).
+const RESOLVER_STALL_TIMEOUT_US: u64 = 60_000_000;
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -235,6 +239,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut zero_send_with_streams = 0u64;
         let mut data_ready_skips = 0u64;
         let mut last_flow_block_log_at = 0u64;
+        let mut last_recv_at = 0u64;
 
         loop {
             let current_time = unsafe { picoquic_current_time() };
@@ -247,6 +252,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
             let ready = unsafe { (*state_ptr).is_ready() };
             if ready {
+                if last_recv_at == 0 {
+                    last_recv_at = unsafe { picoquic_current_time() };
+                }
                 unsafe {
                     (*state_ptr).update_acceptor_limit(cnx);
                 }
@@ -328,6 +336,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     recv = udp.recv_from(&mut recv_buf) => {
                         match recv {
                             Ok((size, peer)) => {
+                                last_recv_at = unsafe { picoquic_current_time() };
                                 let mut response_ctx = DnsResponseContext {
                                     quic,
                                     local_addr_storage: &local_addr_storage,
@@ -365,6 +374,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             drain_stream_data(cnx, state_ptr);
             drain_path_events(cnx, &mut resolvers, state_ptr);
 
+            let mut sent_quic_data = false;
             for _ in 0..packet_loop_send_max {
                 let current_time = unsafe { picoquic_current_time() };
                 let mut send_length: libc::size_t = 0;
@@ -400,12 +410,13 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     let streams_len = unsafe { (*state_ptr).streams_len() };
                     if streams_len > 0 {
                         zero_send_with_streams = zero_send_with_streams.saturating_add(1);
-                        let flow_blocked = unsafe { slipstream_is_flow_blocked(cnx) } != 0;
-                        if flow_blocked {
-                            for resolver in resolvers.iter_mut() {
-                                if resolver.mode == ResolverMode::Recursive && resolver.added {
-                                    resolver.pending_polls = resolver.pending_polls.max(1);
-                                }
+                        // Ensure recursive resolvers keep polling even when the
+                        // congestion window is full (not just flow control).
+                        // The server can only send ACKs inside DNS responses,
+                        // so we must keep querying to unblock the CWND.
+                        for resolver in resolvers.iter_mut() {
+                            if resolver.mode == ResolverMode::Recursive && resolver.added {
+                                resolver.pending_polls = resolver.pending_polls.max(1);
                             }
                         }
                     }
@@ -415,6 +426,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 if addr_to.ss_family == 0 {
                     break;
                 }
+                sent_quic_data = true;
                 if let Ok(dest) = sockaddr_storage_to_socket_addr(&addr_to) {
                     let dest = normalize_dual_stack_addr(dest);
                     if let Some(resolver) = find_resolver_by_addr_mut(&mut resolvers, dest) {
@@ -501,7 +513,12 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         let inflight_packets =
                             inflight_packet_estimate(quality.bytes_in_transit, mtu);
                         let mut poll_deficit = pacing_target.saturating_sub(inflight_packets);
-                        if has_ready_stream && !flow_blocked {
+                        // Only suppress polls when the send loop actually produced
+                        // QUIC packets (which act as implicit polls). When CWND is
+                        // full, prepare_next_packet_ex returns nothing—but the server
+                        // can only send ACKs inside DNS responses, so we must keep
+                        // polling to unblock the congestion window.
+                        if has_ready_stream && !flow_blocked && sent_quic_data {
                             poll_deficit = 0;
                         }
                         if poll_deficit > 0 && resolver.debug.enabled {
@@ -569,6 +586,24 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                             }
                         }
                     }
+                }
+            }
+
+            // Detect resolver stall: if we've been sending polls but getting
+            // no DNS responses for RESOLVER_STALL_TIMEOUT_US, the recursive
+            // resolver likely stopped forwarding.  Force a reconnect so the
+            // new QUIC handshake resets resolver state.
+            if last_recv_at > 0 && ready {
+                let stall_us = unsafe { picoquic_current_time() }.saturating_sub(last_recv_at);
+                if stall_us >= RESOLVER_STALL_TIMEOUT_US {
+                    let streams_len = unsafe { (*state_ptr).streams_len() };
+                    warn!(
+                        "resolver stall detected: no DNS responses for {:.1}s, streams={}, forcing reconnect",
+                        stall_us as f64 / 1_000_000.0,
+                        streams_len,
+                    );
+                    unsafe { picoquic_close(cnx, 0) };
+                    break;
                 }
             }
 

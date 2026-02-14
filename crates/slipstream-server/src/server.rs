@@ -19,7 +19,7 @@ use std::ffi::CString;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{lookup_host, UdpSocket as TokioUdpSocket};
@@ -42,8 +42,58 @@ pub(crate) const STREAM_READ_CHUNK_BYTES: usize = 4096;
 pub(crate) const DEFAULT_TCP_RCVBUF_BYTES: usize = 256 * 1024;
 pub(crate) const TARGET_WRITE_COALESCE_DEFAULT_BYTES: usize = 256 * 1024;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
+const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(300);
+const WATCHDOG_STALE_SECS: u64 = 30;
+const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 static SHOULD_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Watchdog that runs on a separate OS thread (not tokio) to detect when the
+/// single-threaded tokio runtime freezes (e.g. a picoquic C FFI call hangs).
+/// If the main loop hasn't updated the heartbeat for WATCHDOG_STALE_SECS,
+/// the watchdog aborts the process so systemd can restart it.
+pub(crate) struct Watchdog {
+    heartbeat: Arc<AtomicU64>,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+impl Watchdog {
+    pub(crate) fn spawn() -> Self {
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let hb = Arc::clone(&heartbeat);
+        let handle = std::thread::Builder::new()
+            .name("watchdog".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(WATCHDOG_CHECK_INTERVAL);
+                    let ts = hb.load(Ordering::Relaxed);
+                    if ts == 0 {
+                        // Not started yet.
+                        continue;
+                    }
+                    let now = unsafe { picoquic_current_time() };
+                    let stale_us = now.saturating_sub(ts);
+                    if stale_us > WATCHDOG_STALE_SECS * 1_000_000 {
+                        eprintln!(
+                            "WATCHDOG: main loop stalled for {:.1}s, aborting process",
+                            stale_us as f64 / 1_000_000.0
+                        );
+                        std::process::abort();
+                    }
+                }
+            })
+            .expect("failed to spawn watchdog thread");
+        Self {
+            heartbeat,
+            _handle: handle,
+        }
+    }
+
+    pub(crate) fn pet(&self) {
+        let now = unsafe { picoquic_current_time() };
+        self.heartbeat.store(now, Ordering::Relaxed);
+    }
+}
 
 extern "C" fn handle_sigterm(_signum: libc::c_int) {
     SHOULD_SHUTDOWN.store(true, Ordering::Relaxed);
@@ -282,8 +332,11 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
     let mut last_seen = HashMap::new();
     let mut last_idle_gc = Instant::now();
     let mut last_flow_block_log_at: u64 = 0;
+    let mut last_health_log = Instant::now();
+    let watchdog = Watchdog::spawn();
 
     loop {
+        watchdog.pet();
         drain_commands(state_ptr, &mut command_rx);
 
         if SHOULD_SHUTDOWN.load(Ordering::Relaxed) {
@@ -370,6 +423,18 @@ pub async fn run_server(config: &ServerConfig) -> Result<i32, ServerError> {
 
         drain_commands(state_ptr, &mut command_rx);
         maybe_report_command_stats(state_ptr);
+
+        if now.duration_since(last_health_log) >= HEALTH_LOG_INTERVAL {
+            last_health_log = now;
+            let active = collect_active_connections(quic);
+            let total_streams = unsafe { (&*state_ptr).total_stream_count() };
+            tracing::info!(
+                "health: connections={} streams={} slots={}",
+                active.len(),
+                total_streams,
+                slots.len(),
+            );
+        }
 
         if slots.is_empty() {
             continue;

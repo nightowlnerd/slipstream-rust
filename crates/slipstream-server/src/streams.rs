@@ -113,6 +113,10 @@ impl ServerState {
         }
     }
 
+    pub(crate) fn total_stream_count(&self) -> usize {
+        self.streams.len()
+    }
+
     pub(crate) fn stream_debug_metrics(&self, cnx_id: usize) -> ServerStreamMetrics {
         let mut metrics = ServerStreamMetrics {
             multi_stream: self.multi_streams.contains(&cnx_id),

@@ -312,6 +312,7 @@ extern "C" {
     pub fn slipstream_is_flow_blocked(cnx: *mut picoquic_cnx_t) -> c_int;
     pub fn slipstream_has_ready_stream(cnx: *mut picoquic_cnx_t) -> c_int;
     pub fn slipstream_disable_ack_delay(cnx: *mut picoquic_cnx_t);
+    pub fn slipstream_is_stream_send_closed(cnx: *mut picoquic_cnx_t, stream_id: u64) -> c_int;
     pub fn slipstream_find_path_id_by_addr(
         cnx: *mut picoquic_cnx_t,
         addr_peer: *const sockaddr,

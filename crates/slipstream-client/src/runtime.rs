@@ -26,9 +26,10 @@ use slipstream_ffi::{
         picoquic_close, picoquic_cnx_t, picoquic_connection_id_t, picoquic_create,
         picoquic_create_client_cnx, picoquic_current_time, picoquic_disable_keep_alive,
         picoquic_enable_keep_alive, picoquic_enable_path_callbacks,
-        picoquic_enable_path_callbacks_default, picoquic_get_next_wake_delay,
-        picoquic_prepare_next_packet_ex, picoquic_set_callback, slipstream_has_ready_stream,
-        slipstream_is_flow_blocked, slipstream_mixed_cc_algorithm, slipstream_set_cc_override,
+        picoquic_enable_path_callbacks_default, picoquic_get_cnx_state,
+        picoquic_get_next_wake_delay, picoquic_prepare_next_packet_ex, picoquic_set_callback,
+        picoquic_state_enum, slipstream_has_ready_stream, slipstream_is_flow_blocked,
+        slipstream_mixed_cc_algorithm, slipstream_set_cc_override,
         slipstream_set_default_path_mode, PICOQUIC_CONNECTION_ID_MAX_SIZE,
         PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX, PICOQUIC_PACKET_LOOP_SEND_MAX,
     },
@@ -56,6 +57,9 @@ const MIN_POLL_INTERVAL_US: u64 = 100;
 /// connection is active.  This catches cases where the recursive resolver
 /// silently stops forwarding queries (rate-limit, anti-tunnel heuristic, etc.).
 const RESOLVER_STALL_TIMEOUT_US: u64 = 60_000_000;
+/// Periodic health heartbeat log interval (5 minutes).  Emits connection
+/// state at INFO level so we can diagnose silent tunnel deaths.
+const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -240,6 +244,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut data_ready_skips = 0u64;
         let mut last_flow_block_log_at = 0u64;
         let mut last_recv_at = 0u64;
+        let mut last_health_log_at = 0u64;
 
         loop {
             let current_time = unsafe { picoquic_current_time() };
@@ -250,10 +255,20 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 break;
             }
 
+            // Detect broken QUIC connection state that the callback missed.
+            let cnx_state = unsafe { picoquic_get_cnx_state(cnx) };
+            if cnx_state as u32 >= picoquic_state_enum::picoquic_state_disconnecting as u32 {
+                warn!(
+                    "QUIC connection unhealthy: state={:?}, forcing reconnect",
+                    cnx_state
+                );
+                break;
+            }
+
             let ready = unsafe { (*state_ptr).is_ready() };
             if ready {
                 if last_recv_at == 0 {
-                    last_recv_at = unsafe { picoquic_current_time() };
+                    last_recv_at = current_time;
                 }
                 unsafe {
                     (*state_ptr).update_acceptor_limit(cnx);
@@ -336,7 +351,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     recv = udp.recv_from(&mut recv_buf) => {
                         match recv {
                             Ok((size, peer)) => {
-                                last_recv_at = unsafe { picoquic_current_time() };
+                                last_recv_at = current_time;
                                 let mut response_ctx = DnsResponseContext {
                                     quic,
                                     local_addr_storage: &local_addr_storage,
@@ -641,6 +656,28 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     pending_for_debug,
                     inflight_polls,
                     resolver.last_pacing_snapshot,
+                );
+            }
+
+            // Periodic health heartbeat: log key metrics at INFO level so we
+            // can diagnose silent tunnel deaths from production logs.
+            if ready && report_time.saturating_sub(last_health_log_at) >= HEALTH_LOG_INTERVAL_US {
+                last_health_log_at = report_time;
+                let (acceptor_used, acceptor_max) = unsafe { (*state_ptr).acceptor_metrics() };
+                let recv_age_s = if last_recv_at > 0 {
+                    report_time.saturating_sub(last_recv_at) / 1_000_000
+                } else {
+                    0
+                };
+                info!(
+                    "health: streams={} cnx_state={:?} recv_age={}s acceptor={}/{} zero_send_with_streams={} data_ready_skips={}",
+                    streams_len,
+                    cnx_state,
+                    recv_age_s,
+                    acceptor_used,
+                    acceptor_max,
+                    zero_send_with_streams,
+                    data_ready_skips,
                 );
             }
         }

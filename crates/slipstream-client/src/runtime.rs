@@ -110,23 +110,50 @@ impl Watchdog {
         let ph = Arc::clone(&phase);
         let handle = std::thread::Builder::new()
             .name("watchdog".into())
-            .spawn(move || loop {
-                std::thread::sleep(WATCHDOG_CHECK_INTERVAL);
-                let ts = hb.load(Ordering::Relaxed);
-                if ts == 0 {
-                    continue;
-                }
-                let now = unsafe { picoquic_current_time() };
-                let stale_us = now.saturating_sub(ts);
-                if stale_us > WATCHDOG_STALE_SECS * 1_000_000 {
-                    let stuck_phase = ph.load(Ordering::Relaxed);
-                    eprintln!(
-                        "WATCHDOG: main loop stalled for {:.1}s at phase {} ({}), aborting process",
-                        stale_us as f64 / 1_000_000.0,
-                        stuck_phase,
-                        phase_name(stuck_phase),
-                    );
-                    std::process::abort();
+            .spawn(move || {
+                let mut last_check = unsafe { picoquic_current_time() };
+                loop {
+                    std::thread::sleep(WATCHDOG_CHECK_INTERVAL);
+                    let now = unsafe { picoquic_current_time() };
+                    let ts = hb.load(Ordering::Relaxed);
+                    if ts == 0 {
+                        last_check = now;
+                        continue;
+                    }
+                    let stale_us = now.saturating_sub(ts);
+                    let own_sleep_us = now.saturating_sub(last_check);
+                    last_check = now;
+                    // If the watchdog thread itself slept much longer than expected,
+                    // both threads were frozen (VPS suspend). Don't abort — the QUIC
+                    // connection likely survived the brief suspend.
+                    let expected_sleep_us =
+                        WATCHDOG_CHECK_INTERVAL.as_micros() as u64;
+                    if stale_us > WATCHDOG_STALE_SECS * 1_000_000
+                        && own_sleep_us > expected_sleep_us * 3
+                    {
+                        let stuck_phase = ph.load(Ordering::Relaxed);
+                        eprintln!(
+                            "WATCHDOG: VPS suspend detected ({:.1}s gap, own sleep {:.1}s), \
+                             phase {} ({}), NOT aborting — petting heartbeat",
+                            stale_us as f64 / 1_000_000.0,
+                            own_sleep_us as f64 / 1_000_000.0,
+                            stuck_phase,
+                            phase_name(stuck_phase),
+                        );
+                        // Reset heartbeat so main loop doesn't immediately trigger again
+                        hb.store(now, Ordering::Relaxed);
+                        continue;
+                    }
+                    if stale_us > WATCHDOG_STALE_SECS * 1_000_000 {
+                        let stuck_phase = ph.load(Ordering::Relaxed);
+                        eprintln!(
+                            "WATCHDOG: main loop stalled for {:.1}s at phase {} ({}), aborting process",
+                            stale_us as f64 / 1_000_000.0,
+                            stuck_phase,
+                            phase_name(stuck_phase),
+                        );
+                        std::process::abort();
+                    }
                 }
             })
             .expect("failed to spawn watchdog thread");

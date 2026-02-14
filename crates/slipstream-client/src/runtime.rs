@@ -27,7 +27,8 @@ use slipstream_ffi::{
         picoquic_create_client_cnx, picoquic_current_time, picoquic_disable_keep_alive,
         picoquic_enable_keep_alive, picoquic_enable_path_callbacks,
         picoquic_enable_path_callbacks_default, picoquic_get_next_wake_delay,
-        picoquic_prepare_next_packet_ex, picoquic_set_callback, slipstream_has_ready_stream,
+        picoquic_prepare_next_packet_ex, picoquic_set_callback,
+        picoquic_set_default_multipath_option, slipstream_has_ready_stream,
         slipstream_is_flow_blocked, slipstream_mixed_cc_algorithm, slipstream_set_cc_override,
         slipstream_set_default_path_mode, PICOQUIC_CONNECTION_ID_MAX_SIZE,
         PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX, PICOQUIC_PACKET_LOOP_SEND_MAX,
@@ -179,6 +180,12 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         }
         unsafe {
             configure_quic_with_custom(quic, mixed_cc, mtu);
+            // Multipath is only useful with multiple resolvers. With a single
+            // resolver picoquic's CID provisioning can exhaust the connection ID
+            // limit over time, causing 0x9 CONNECTION_ID_LIMIT_ERROR.
+            if resolvers.len() <= 1 {
+                picoquic_set_default_multipath_option(quic, 0);
+            }
             picoquic_enable_path_callbacks_default(quic, 1);
             let override_ptr = cc_override
                 .as_ref()

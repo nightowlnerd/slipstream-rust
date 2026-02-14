@@ -68,6 +68,13 @@ int slipstream_get_path_id_from_unique(picoquic_cnx_t *cnx, uint64_t unique_path
     return path_id;
 }
 
+void slipstream_set_cid_limit(picoquic_quic_t *quic, uint32_t limit) {
+    if (quic == NULL || limit == 0) {
+        return;
+    }
+    quic->default_tp.active_connection_id_limit = limit;
+}
+
 uint64_t slipstream_get_max_streams_bidir_remote(picoquic_cnx_t *cnx) {
     if (cnx == NULL || cnx->remote_parameters_received == 0) {
         return 0;

@@ -39,7 +39,7 @@ use std::ffi::CString;
 use std::net::Ipv6Addr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -47,7 +47,7 @@ use tracing::{debug, error, info, warn};
 // Protocol defaults; see docs/config.md for details.
 const SLIPSTREAM_ALPN: &str = "picoquic_sample";
 const SLIPSTREAM_SNI: &str = "test.example.com";
-const DNS_WAKE_DELAY_MAX_US: i64 = 10_000_000;
+const DNS_WAKE_DELAY_MAX_US: i64 = 5_000_000;
 const DNS_POLL_SLICE_US: u64 = 50_000;
 const RECONNECT_SLEEP_MIN_MS: u64 = 250;
 const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
@@ -60,8 +60,8 @@ const RESOLVER_STALL_TIMEOUT_US: u64 = 60_000_000;
 /// Periodic health heartbeat log interval (5 minutes).  Emits connection
 /// state at INFO level so we can diagnose silent tunnel deaths.
 const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
-const WATCHDOG_STALE_SECS: u64 = 30;
-const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const WATCHDOG_STALE_SECS: u64 = 15;
+const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Watchdog that runs on a separate OS thread (not tokio) to detect when the
 /// single-threaded tokio runtime freezes (e.g. a picoquic C FFI call hangs).
@@ -435,6 +435,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             let timeout = Duration::from_micros(timeout_us);
 
             watchdog.set_phase(PHASE_SELECT);
+            let pre_select = Instant::now();
             if data_ready.swap(false, Ordering::Acquire) {
                 data_ready_skips = data_ready_skips.saturating_add(1);
             } else {
@@ -485,6 +486,16 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     _ = sleep(timeout) => {}
                 }
             }
+            let select_elapsed = pre_select.elapsed();
+            if select_elapsed > Duration::from_secs(10) {
+                warn!(
+                    "select overslept: {:.1}s (timeout was {:.1}s, has_work={})",
+                    select_elapsed.as_secs_f64(),
+                    timeout.as_secs_f64(),
+                    has_work,
+                );
+            }
+            watchdog.pet();
 
             watchdog.set_phase(PHASE_POST_DRAIN);
             drain_commands(cnx, state_ptr, &mut command_rx);

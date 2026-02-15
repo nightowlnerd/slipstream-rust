@@ -26,9 +26,10 @@ use slipstream_ffi::{
         picoquic_close, picoquic_cnx_t, picoquic_connection_id_t, picoquic_create,
         picoquic_create_client_cnx, picoquic_current_time, picoquic_disable_keep_alive,
         picoquic_enable_keep_alive, picoquic_enable_path_callbacks,
-        picoquic_enable_path_callbacks_default, picoquic_get_next_wake_delay,
-        picoquic_prepare_next_packet_ex, picoquic_set_callback, slipstream_has_ready_stream,
-        slipstream_is_flow_blocked, slipstream_mixed_cc_algorithm, slipstream_set_cc_override,
+        picoquic_enable_path_callbacks_default, picoquic_get_cnx_state,
+        picoquic_get_next_wake_delay, picoquic_prepare_next_packet_ex, picoquic_set_callback,
+        picoquic_state_enum, slipstream_has_ready_stream, slipstream_is_flow_blocked,
+        slipstream_mixed_cc_algorithm, slipstream_set_cc_override,
         slipstream_set_default_path_mode, PICOQUIC_CONNECTION_ID_MAX_SIZE,
         PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX, PICOQUIC_PACKET_LOOP_SEND_MAX,
     },
@@ -36,9 +37,9 @@ use slipstream_ffi::{
 };
 use std::ffi::CString;
 use std::net::Ipv6Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -52,6 +53,135 @@ const RECONNECT_SLEEP_MIN_MS: u64 = 250;
 const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
 const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
 const MIN_POLL_INTERVAL_US: u64 = 100;
+/// Force a reconnect if no DNS responses arrive within this window while the
+/// connection is active.  This catches cases where the recursive resolver
+/// silently stops forwarding queries (rate-limit, anti-tunnel heuristic, etc.).
+const RESOLVER_STALL_TIMEOUT_US: u64 = 60_000_000;
+/// Periodic health heartbeat log interval (5 minutes).  Emits connection
+/// state at INFO level so we can diagnose silent tunnel deaths.
+const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
+const WATCHDOG_STALE_SECS: u64 = 15;
+const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Watchdog that runs on a separate OS thread (not tokio) to detect when the
+/// single-threaded tokio runtime freezes (e.g. a picoquic C FFI call hangs).
+/// If the main loop hasn't updated the heartbeat for WATCHDOG_STALE_SECS,
+/// the watchdog aborts the process so systemd can restart it.
+struct Watchdog {
+    heartbeat: Arc<AtomicU64>,
+    phase: Arc<AtomicU32>,
+    alive: Arc<AtomicBool>,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+const PHASE_DRAIN_COMMANDS: u32 = 1;
+const PHASE_DRAIN_STREAM_DATA: u32 = 2;
+const PHASE_CNX_STATE_CHECK: u32 = 3;
+const PHASE_WAKE_DELAY: u32 = 4;
+const PHASE_SELECT: u32 = 5;
+const PHASE_POST_DRAIN: u32 = 6;
+const PHASE_PREPARE_PACKET: u32 = 7;
+const PHASE_SEND_DNS: u32 = 8;
+const PHASE_POLL_QUERIES: u32 = 9;
+const PHASE_HEALTH_LOG: u32 = 10;
+
+fn phase_name(phase: u32) -> &'static str {
+    match phase {
+        PHASE_DRAIN_COMMANDS => "drain_commands",
+        PHASE_DRAIN_STREAM_DATA => "drain_stream_data",
+        PHASE_CNX_STATE_CHECK => "cnx_state_check",
+        PHASE_WAKE_DELAY => "wake_delay",
+        PHASE_SELECT => "select/sleep",
+        PHASE_POST_DRAIN => "post_select_drain",
+        PHASE_PREPARE_PACKET => "prepare_next_packet_ex",
+        PHASE_SEND_DNS => "send_dns_query",
+        PHASE_POLL_QUERIES => "send_poll_queries",
+        PHASE_HEALTH_LOG => "health_log",
+        _ => "unknown",
+    }
+}
+
+impl Watchdog {
+    fn spawn() -> Self {
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let phase = Arc::new(AtomicU32::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        let hb = Arc::clone(&heartbeat);
+        let ph = Arc::clone(&phase);
+        let al = Arc::clone(&alive);
+        let handle = std::thread::Builder::new()
+            .name("watchdog".into())
+            .spawn(move || {
+                let mut last_check = Instant::now();
+                while al.load(Ordering::Relaxed) {
+                    std::thread::sleep(WATCHDOG_CHECK_INTERVAL);
+                    if !al.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let now_instant = Instant::now();
+                    let ts = hb.load(Ordering::Relaxed);
+                    if ts == 0 {
+                        last_check = now_instant;
+                        continue;
+                    }
+                    let now_pico = unsafe { picoquic_current_time() };
+                    let stale_us = now_pico.saturating_sub(ts);
+                    let own_sleep = now_instant.duration_since(last_check);
+                    let own_sleep_us = own_sleep.as_micros() as u64;
+                    last_check = now_instant;
+                    let expected_sleep_us =
+                        WATCHDOG_CHECK_INTERVAL.as_micros() as u64;
+                    if stale_us > WATCHDOG_STALE_SECS * 1_000_000
+                        && own_sleep_us > expected_sleep_us * 3
+                    {
+                        let stuck_phase = ph.load(Ordering::Relaxed);
+                        eprintln!(
+                            "WATCHDOG: VPS suspend detected ({:.1}s gap, own sleep {:.1}s), \
+                             phase {} ({}), NOT aborting — petting heartbeat",
+                            stale_us as f64 / 1_000_000.0,
+                            own_sleep_us as f64 / 1_000_000.0,
+                            stuck_phase,
+                            phase_name(stuck_phase),
+                        );
+                        hb.store(now_pico, Ordering::Relaxed);
+                        continue;
+                    }
+                    if stale_us > WATCHDOG_STALE_SECS * 1_000_000 {
+                        let stuck_phase = ph.load(Ordering::Relaxed);
+                        eprintln!(
+                            "WATCHDOG: main loop stalled for {:.1}s at phase {} ({}), aborting process",
+                            stale_us as f64 / 1_000_000.0,
+                            stuck_phase,
+                            phase_name(stuck_phase),
+                        );
+                        std::process::abort();
+                    }
+                }
+            })
+            .expect("failed to spawn watchdog thread");
+        Self {
+            heartbeat,
+            phase,
+            alive,
+            _handle: handle,
+        }
+    }
+
+    fn pet(&self) {
+        let now = unsafe { picoquic_current_time() };
+        self.heartbeat.store(now, Ordering::Relaxed);
+    }
+
+    fn set_phase(&self, p: u32) {
+        self.phase.store(p, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Relaxed);
+    }
+}
 
 fn is_ipv6_unspecified(host: &str) -> bool {
     host.parse::<Ipv6Addr>()
@@ -216,7 +346,8 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             picoquic_set_callback(cnx, Some(client_callback), state_ptr as *mut _);
             picoquic_enable_path_callbacks(cnx, 1);
             if config.keep_alive_interval > 0 {
-                picoquic_enable_keep_alive(cnx, config.keep_alive_interval as u64 * 1000);
+                // picoquic expects microseconds; config value is in seconds.
+                picoquic_enable_keep_alive(cnx, config.keep_alive_interval as u64 * 1_000_000);
             } else {
                 picoquic_disable_keep_alive(cnx);
             }
@@ -235,18 +366,38 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut zero_send_with_streams = 0u64;
         let mut data_ready_skips = 0u64;
         let mut last_flow_block_log_at = 0u64;
+        let mut last_recv_at = 0u64;
+        let mut last_health_log_at = 0u64;
+        let watchdog = Watchdog::spawn();
 
         loop {
+            watchdog.pet();
+            watchdog.set_phase(PHASE_DRAIN_COMMANDS);
             let current_time = unsafe { picoquic_current_time() };
             drain_commands(cnx, state_ptr, &mut command_rx);
+            watchdog.set_phase(PHASE_DRAIN_STREAM_DATA);
             drain_stream_data(cnx, state_ptr);
+            watchdog.set_phase(PHASE_CNX_STATE_CHECK);
             let closing = unsafe { (*state_ptr).is_closing() };
             if closing {
                 break;
             }
 
+            // Detect broken QUIC connection state that the callback missed.
+            let cnx_state = unsafe { picoquic_get_cnx_state(cnx) };
+            if cnx_state as u32 >= picoquic_state_enum::picoquic_state_disconnecting as u32 {
+                warn!(
+                    "QUIC connection unhealthy: state={:?}, forcing reconnect",
+                    cnx_state
+                );
+                break;
+            }
+
             let ready = unsafe { (*state_ptr).is_ready() };
             if ready {
+                if last_recv_at == 0 {
+                    last_recv_at = current_time;
+                }
                 unsafe {
                     (*state_ptr).update_acceptor_limit(cnx);
                 }
@@ -268,6 +419,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
 
+            watchdog.set_phase(PHASE_WAKE_DELAY);
             let delay_us =
                 unsafe { picoquic_get_next_wake_delay(quic, current_time, DNS_WAKE_DELAY_MAX_US) };
             let delay_us = if delay_us < 0 { 0 } else { delay_us as u64 };
@@ -311,6 +463,8 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             };
             let timeout = Duration::from_micros(timeout_us);
 
+            watchdog.set_phase(PHASE_SELECT);
+            let pre_select = Instant::now();
             if data_ready.swap(false, Ordering::Acquire) {
                 data_ready_skips = data_ready_skips.saturating_add(1);
             } else {
@@ -328,6 +482,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     recv = udp.recv_from(&mut recv_buf) => {
                         match recv {
                             Ok((size, peer)) => {
+                                last_recv_at = unsafe { picoquic_current_time() };
                                 let mut response_ctx = DnsResponseContext {
                                     quic,
                                     local_addr_storage: &local_addr_storage,
@@ -360,12 +515,25 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     _ = sleep(timeout) => {}
                 }
             }
+            let select_elapsed = pre_select.elapsed();
+            if select_elapsed > Duration::from_secs(10) {
+                warn!(
+                    "select overslept: {:.1}s (timeout was {:.1}s, has_work={})",
+                    select_elapsed.as_secs_f64(),
+                    timeout.as_secs_f64(),
+                    has_work,
+                );
+            }
+            watchdog.pet();
 
+            watchdog.set_phase(PHASE_POST_DRAIN);
             drain_commands(cnx, state_ptr, &mut command_rx);
             drain_stream_data(cnx, state_ptr);
             drain_path_events(cnx, &mut resolvers, state_ptr);
 
+            let mut sent_quic_data = false;
             for _ in 0..packet_loop_send_max {
+                watchdog.set_phase(PHASE_PREPARE_PACKET);
                 let current_time = unsafe { picoquic_current_time() };
                 let mut send_length: libc::size_t = 0;
                 let mut addr_to: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -400,12 +568,13 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     let streams_len = unsafe { (*state_ptr).streams_len() };
                     if streams_len > 0 {
                         zero_send_with_streams = zero_send_with_streams.saturating_add(1);
-                        let flow_blocked = unsafe { slipstream_is_flow_blocked(cnx) } != 0;
-                        if flow_blocked {
-                            for resolver in resolvers.iter_mut() {
-                                if resolver.mode == ResolverMode::Recursive && resolver.added {
-                                    resolver.pending_polls = resolver.pending_polls.max(1);
-                                }
+                        // Ensure recursive resolvers keep polling even when the
+                        // congestion window is full (not just flow control).
+                        // The server can only send ACKs inside DNS responses,
+                        // so we must keep querying to unblock the CWND.
+                        for resolver in resolvers.iter_mut() {
+                            if resolver.mode == ResolverMode::Recursive && resolver.added {
+                                resolver.pending_polls = resolver.pending_polls.max(1);
                             }
                         }
                     }
@@ -415,6 +584,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 if addr_to.ss_family == 0 {
                     break;
                 }
+                sent_quic_data = true;
                 if let Ok(dest) = sockaddr_storage_to_socket_addr(&addr_to) {
                     let dest = normalize_dual_stack_addr(dest);
                     if let Some(resolver) = find_resolver_by_addr_mut(&mut resolvers, dest) {
@@ -425,6 +595,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     }
                 }
 
+                watchdog.set_phase(PHASE_SEND_DNS);
                 let qname = build_qname(&send_buf[..send_length], config.domain)
                     .map_err(|err| ClientError::new(err.to_string()))?;
                 let params = QueryParams {
@@ -487,6 +658,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     last_flow_block_log_at = now;
                 }
             }
+            watchdog.set_phase(PHASE_POLL_QUERIES);
             for resolver in resolvers.iter_mut() {
                 if !refresh_resolver_path(cnx, resolver) {
                     continue;
@@ -501,7 +673,12 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         let inflight_packets =
                             inflight_packet_estimate(quality.bytes_in_transit, mtu);
                         let mut poll_deficit = pacing_target.saturating_sub(inflight_packets);
-                        if has_ready_stream && !flow_blocked {
+                        // Only suppress polls when the send loop actually produced
+                        // QUIC packets (which act as implicit polls). When CWND is
+                        // full, prepare_next_packet_ex returns nothing—but the server
+                        // can only send ACKs inside DNS responses, so we must keep
+                        // polling to unblock the congestion window.
+                        if has_ready_stream && !flow_blocked && sent_quic_data {
                             poll_deficit = 0;
                         }
                         if poll_deficit > 0 && resolver.debug.enabled {
@@ -572,6 +749,27 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
 
+            // Detect resolver stall: if we've been sending polls but getting
+            // no DNS responses for RESOLVER_STALL_TIMEOUT_US, the recursive
+            // resolver likely stopped forwarding.  Force a reconnect so the
+            // new QUIC handshake resets resolver state.
+            // Only check when streams are active — idle connections legitimately
+            // receive no responses and should not trigger a reconnect.
+            if last_recv_at > 0 && ready {
+                let streams_len = unsafe { (*state_ptr).streams_len() };
+                let stall_us = current_time.saturating_sub(last_recv_at);
+                if streams_len > 0 && stall_us >= RESOLVER_STALL_TIMEOUT_US {
+                    warn!(
+                        "resolver stall detected: no DNS responses for {:.1}s, streams={}, forcing reconnect",
+                        stall_us as f64 / 1_000_000.0,
+                        streams_len,
+                    );
+                    // Don't close here — the post-loop picoquic_close handles it.
+                    break;
+                }
+            }
+
+            watchdog.set_phase(PHASE_HEALTH_LOG);
             let report_time = unsafe { picoquic_current_time() };
             let (enqueued_bytes, last_enqueue_at) = unsafe { (*state_ptr).debug_snapshot() };
             let streams_len = unsafe { (*state_ptr).streams_len() };
@@ -606,6 +804,28 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     pending_for_debug,
                     inflight_polls,
                     resolver.last_pacing_snapshot,
+                );
+            }
+
+            // Periodic health heartbeat: log key metrics at INFO level so we
+            // can diagnose silent tunnel deaths from production logs.
+            if ready && report_time.saturating_sub(last_health_log_at) >= HEALTH_LOG_INTERVAL_US {
+                last_health_log_at = report_time;
+                let (acceptor_used, acceptor_max) = unsafe { (*state_ptr).acceptor_metrics() };
+                let recv_age_s = if last_recv_at > 0 {
+                    report_time.saturating_sub(last_recv_at) / 1_000_000
+                } else {
+                    0
+                };
+                info!(
+                    "health: streams={} cnx_state={:?} recv_age={}s acceptor={}/{} zero_send_with_streams={} data_ready_skips={}",
+                    streams_len,
+                    cnx_state,
+                    recv_age_s,
+                    acceptor_used,
+                    acceptor_max,
+                    zero_send_with_streams,
+                    data_ready_skips,
                 );
             }
         }

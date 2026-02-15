@@ -390,11 +390,25 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut acceptor_saturated_bytes: u64 = 0;
         let watchdog = Watchdog::spawn();
 
+        // Clear closing flag that picoquic_free (QuicGuard::drop) may have
+        // set via the close callback at the end of the previous iteration.
+        unsafe {
+            (*state_ptr).clear_closing();
+        }
+
         loop {
             watchdog.pet();
             watchdog.set_phase(PHASE_DRAIN_COMMANDS);
             let current_time = unsafe { picoquic_current_time() };
-            drain_commands(cnx, state_ptr, &mut command_rx);
+            // Only process application commands after the QUIC handshake
+            // completes.  During reconnect the acceptor may queue NewStream
+            // commands while the connection is still in initial state;
+            // processing them before ready triggers picoquic errors (0xc).
+            if unsafe { (*state_ptr).is_ready() } {
+                drain_commands(cnx, state_ptr, &mut command_rx);
+            } else {
+                let _ = drain_disconnected_commands(&mut command_rx);
+            }
             watchdog.set_phase(PHASE_DRAIN_STREAM_DATA);
             drain_stream_data(cnx, state_ptr);
             watchdog.set_phase(PHASE_CNX_STATE_CHECK);
@@ -493,7 +507,11 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 tokio::select! {
                     command = command_rx.recv() => {
                         if let Some(command) = command {
-                            handle_command(cnx, state_ptr, command);
+                            if unsafe { (*state_ptr).is_ready() } {
+                                handle_command(cnx, state_ptr, command);
+                            } else if let Command::NewStream { stream, .. } = command {
+                                drop(stream);
+                            }
                         }
                     }
                     _ = &mut notified => {
@@ -547,7 +565,11 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             watchdog.pet();
 
             watchdog.set_phase(PHASE_POST_DRAIN);
-            drain_commands(cnx, state_ptr, &mut command_rx);
+            if unsafe { (*state_ptr).is_ready() } {
+                drain_commands(cnx, state_ptr, &mut command_rx);
+            } else {
+                let _ = drain_disconnected_commands(&mut command_rx);
+            }
             drain_stream_data(cnx, state_ptr);
             drain_path_events(cnx, &mut resolvers, state_ptr);
             let reaped_half_closed = unsafe {

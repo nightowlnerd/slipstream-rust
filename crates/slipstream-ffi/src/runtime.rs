@@ -3,11 +3,10 @@ use crate::picoquic::{
     picoquic_disable_port_blocking, picoquic_explain_crypto_error, picoquic_free, picoquic_quic_t,
     picoquic_reset_stream, picoquic_set_cookie_mode, picoquic_set_default_congestion_algorithm,
     picoquic_set_default_congestion_algorithm_by_name, picoquic_set_default_idle_timeout,
-    picoquic_set_default_multipath_option, picoquic_set_default_priority,
-    picoquic_set_initial_send_mtu, picoquic_set_key_log_file_from_env,
-    picoquic_set_max_data_control, picoquic_set_mtu_max, picoquic_set_preemptive_repeat_policy,
-    picoquic_set_stream_data_consumption_mode, picoquic_stop_sending, slipstream_set_cid_limit,
-    slipstream_take_stateless_packet_for_cid, PICOQUIC_MAX_PACKET_SIZE,
+    picoquic_set_default_priority, picoquic_set_initial_send_mtu,
+    picoquic_set_key_log_file_from_env, picoquic_set_max_data_control, picoquic_set_mtu_max,
+    picoquic_set_preemptive_repeat_policy, picoquic_set_stream_data_consumption_mode,
+    picoquic_stop_sending, slipstream_take_stateless_packet_for_cid, PICOQUIC_MAX_PACKET_SIZE,
 };
 use libc::{c_char, c_int, c_ulong, size_t, sockaddr_storage};
 use slipstream_core::tcp::stream_write_buffer_bytes;
@@ -75,11 +74,6 @@ unsafe fn configure_quic_common(quic: *mut picoquic_quic_t, mtu: u32) {
     // idle_timeout / 2 = 300s when enabled.
     picoquic_set_default_idle_timeout(quic, 600_000);
     picoquic_set_default_priority(quic, 2);
-    picoquic_set_default_multipath_option(quic, 1);
-    // Multipath provisions 8 CIDs per path; the default limit of 8 is too
-    // low once there are 2+ paths (receiver caps at 2×limit globally).
-    // 32 accommodates up to ~7 simultaneous paths / resolvers.
-    slipstream_set_cid_limit(quic, 32);
     picoquic_set_preemptive_repeat_policy(quic, 1);
     picoquic_disable_port_blocking(quic, 1);
     picoquic_set_stream_data_consumption_mode(quic, 1);

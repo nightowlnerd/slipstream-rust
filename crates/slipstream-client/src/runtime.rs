@@ -57,6 +57,10 @@ const MIN_POLL_INTERVAL_US: u64 = 100;
 /// connection is active.  This catches cases where the recursive resolver
 /// silently stops forwarding queries (rate-limit, anti-tunnel heuristic, etc.).
 const RESOLVER_STALL_TIMEOUT_US: u64 = 60_000_000;
+/// If a stream is half-closed by the remote side and local upload stays open
+/// without forward progress for too long, abort the local reader to avoid
+/// zombie streams exhausting MAX_STREAMS credit.
+const HALF_CLOSE_IDLE_TIMEOUT_US: u64 = 60_000_000;
 /// Periodic health heartbeat log interval (5 minutes).  Emits connection
 /// state at INFO level so we can diagnose silent tunnel deaths.
 const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
@@ -530,6 +534,17 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             drain_commands(cnx, state_ptr, &mut command_rx);
             drain_stream_data(cnx, state_ptr);
             drain_path_events(cnx, &mut resolvers, state_ptr);
+            let reaped_half_closed = unsafe {
+                let now = picoquic_current_time();
+                (*state_ptr).reap_stale_half_closed_streams(now, HALF_CLOSE_IDLE_TIMEOUT_US)
+            };
+            if reaped_half_closed > 0 {
+                warn!(
+                    "reaped {} stale half-closed stream(s) after {}s idle timeout",
+                    reaped_half_closed,
+                    HALF_CLOSE_IDLE_TIMEOUT_US / 1_000_000
+                );
+            }
 
             let mut sent_quic_data = false;
             for _ in 0..packet_loop_send_max {

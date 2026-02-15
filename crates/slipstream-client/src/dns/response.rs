@@ -87,6 +87,12 @@ pub(crate) fn handle_dns_response(
             if resolver.mode == ResolverMode::Authoritative {
                 resolver.inflight_poll_ids.remove(&response_id);
             }
+            // NXDOMAIN (no payload) still counts as a response for the poll
+            // cycle — keep polling so we pull data as soon as the server has it.
+            if resolver.mode == ResolverMode::Recursive {
+                resolver.pending_polls =
+                    resolver.pending_polls.saturating_add(1).min(MAX_POLL_BURST);
+            }
         }
     }
     Ok(())

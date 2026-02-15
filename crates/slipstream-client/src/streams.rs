@@ -487,6 +487,14 @@ impl ClientState {
         self.acceptor.metrics()
     }
 
+    /// Sum of rx + tx bytes across all active streams.
+    pub(crate) fn total_stream_bytes(&self) -> u64 {
+        self.streams
+            .values()
+            .map(|s| s.flow.rx_bytes.saturating_add(s.tx_bytes))
+            .fold(0u64, u64::saturating_add)
+    }
+
     pub(crate) fn debug_snapshot(&self) -> (u64, u64) {
         (self.debug_enqueued_bytes, self.debug_last_enqueue_at)
     }

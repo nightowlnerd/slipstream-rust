@@ -62,6 +62,10 @@ const RESOLVER_STALL_TIMEOUT_US: u64 = 60_000_000;
 /// without forward progress for too long, abort the local reader to avoid
 /// zombie streams exhausting MAX_STREAMS credit.
 const HALF_CLOSE_IDLE_TIMEOUT_US: u64 = 60_000_000;
+/// Force a reconnect if the MAX_STREAMS budget has been fully consumed for
+/// this long.  When flow control deadlocks prevent streams from completing,
+/// picoquic cannot extend MAX_STREAMS and the tunnel is effectively dead.
+const ACCEPTOR_SATURATED_TIMEOUT_US: u64 = 30_000_000;
 /// Periodic health heartbeat log interval (5 minutes).  Emits connection
 /// state at INFO level so we can diagnose silent tunnel deaths.
 const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
@@ -381,6 +385,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut last_flow_block_log_at = 0u64;
         let mut last_recv_at = 0u64;
         let mut last_health_log_at = 0u64;
+        let mut acceptor_saturated_since: u64 = 0;
+        let mut acceptor_saturated_max: usize = 0;
+        let mut acceptor_saturated_bytes: u64 = 0;
         let watchdog = Watchdog::spawn();
 
         loop {
@@ -553,6 +560,46 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     reaped_half_closed,
                     HALF_CLOSE_IDLE_TIMEOUT_US / 1_000_000
                 );
+            }
+
+            // Circuit breaker: force reconnect when MAX_STREAMS is fully
+            // consumed and no progress is being made (flow control deadlock).
+            //
+            // Three gates prevent false-triggering on healthy saturated connections:
+            //   1. `used >= max` — acceptor budget fully consumed
+            //   2. `max` unchanged — peer hasn't extended MAX_STREAMS
+            //   3. total stream bytes unchanged — no data flowing (true deadlock)
+            //
+            // Any gate resetting (MAX_STREAMS extended, or bytes increasing)
+            // restarts the 30s timer.
+            {
+                let (used, max) = unsafe { (*state_ptr).acceptor_metrics() };
+                let total_bytes = unsafe { (*state_ptr).total_stream_bytes() };
+                if max > 0 && used >= max {
+                    let now = unsafe { picoquic_current_time() };
+                    if acceptor_saturated_since == 0
+                        || max != acceptor_saturated_max
+                        || total_bytes != acceptor_saturated_bytes
+                    {
+                        // First saturation, limit extended, or bytes moved — (re)start.
+                        acceptor_saturated_since = now;
+                        acceptor_saturated_max = max;
+                        acceptor_saturated_bytes = total_bytes;
+                    } else if now.saturating_sub(acceptor_saturated_since)
+                        >= ACCEPTOR_SATURATED_TIMEOUT_US
+                    {
+                        warn!(
+                            "acceptor deadlock for {}s ({}/{}, bytes={}, no progress), forcing reconnect",
+                            ACCEPTOR_SATURATED_TIMEOUT_US / 1_000_000,
+                            used,
+                            max,
+                            total_bytes
+                        );
+                        break;
+                    }
+                } else {
+                    acceptor_saturated_since = 0;
+                }
             }
 
             let mut sent_quic_data = false;

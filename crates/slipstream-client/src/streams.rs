@@ -143,6 +143,13 @@ pub(crate) mod acceptor {
             self.limiter.reset();
         }
 
+        /// Returns (used, max) for diagnostic logging.
+        pub(crate) fn metrics(&self) -> (usize, usize) {
+            let used = self.limiter.used.load(Ordering::SeqCst);
+            let max = self.limiter.max.load(Ordering::SeqCst);
+            (used, max)
+        }
+
         #[cfg(test)]
         pub(crate) fn set_test_limit(limit: usize) {
             TEST_ACCEPTOR_LIMIT.store(limit, Ordering::SeqCst);
@@ -475,8 +482,65 @@ impl ClientState {
         }
     }
 
+    /// Returns (used, max) for the acceptor limiter.
+    pub(crate) fn acceptor_metrics(&self) -> (usize, usize) {
+        self.acceptor.metrics()
+    }
+
     pub(crate) fn debug_snapshot(&self) -> (u64, u64) {
         (self.debug_enqueued_bytes, self.debug_last_enqueue_at)
+    }
+
+    pub(crate) fn reap_stale_half_closed_streams(
+        &mut self,
+        now_us: u64,
+        idle_timeout_us: u64,
+    ) -> usize {
+        let stale_streams: Vec<u64> = self
+            .streams
+            .iter()
+            .filter_map(|(stream_id, stream)| {
+                if stream.recv_state != StreamRecvState::FinReceived
+                    || stream.send_state != StreamSendState::Open
+                    || stream.read_abort_tx.is_none()
+                {
+                    return None;
+                }
+                let fin_at = stream.recv_fin_at_us?;
+                let last_activity = fin_at.max(stream.last_tx_progress_at_us);
+                if now_us.saturating_sub(last_activity) >= idle_timeout_us {
+                    Some(*stream_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut reaped = 0usize;
+        for stream_id in stale_streams {
+            if let Some(stream) = self.streams.get_mut(&stream_id) {
+                let Some(read_abort_tx) = stream.read_abort_tx.take() else {
+                    continue;
+                };
+                let fin_at = stream.recv_fin_at_us.unwrap_or(now_us);
+                let idle_since = fin_at.max(stream.last_tx_progress_at_us);
+                let idle_secs = now_us.saturating_sub(idle_since) as f64 / 1_000_000.0;
+                let _ = read_abort_tx.send(());
+                warn!(
+                    "stream {}: stale half-close idle for {:.1}s; aborting local reader (rx_bytes={} tx_bytes={} queued={} recv_state={:?} send_state={:?})",
+                    stream_id,
+                    idle_secs,
+                    stream.flow.rx_bytes,
+                    stream.tx_bytes,
+                    stream.flow.queued_bytes,
+                    stream.recv_state,
+                    stream.send_state
+                );
+                reaped = reaped.saturating_add(1);
+            }
+        }
+
+        reaped
     }
 
     pub(crate) fn stream_debug_metrics(&self) -> ClientStreamMetrics {
@@ -629,6 +693,8 @@ struct ClientStream {
     read_abort_tx: Option<oneshot::Sender<()>>,
     data_rx: Option<mpsc::Receiver<Vec<u8>>>,
     tx_bytes: u64,
+    recv_fin_at_us: Option<u64>,
+    last_tx_progress_at_us: u64,
     recv_state: StreamRecvState,
     send_state: StreamSendState,
     flow: FlowControlState,
@@ -890,6 +956,7 @@ fn handle_stream_data(
                         reset_stream = true;
                     } else {
                         stream.recv_state = StreamRecvState::FinReceived;
+                        stream.recv_fin_at_us = Some(unsafe { picoquic_current_time() });
                     }
                 }
             }
@@ -953,6 +1020,7 @@ mod tests {
     use slipstream_core::test_support::ResetOnDrop;
     use std::sync::Arc;
     use tokio::net::TcpListener as TokioTcpListener;
+    use tokio::sync::oneshot::error::TryRecvError;
     use tokio::sync::{mpsc, oneshot, Notify};
     use tokio::time::{sleep, timeout, Duration};
 
@@ -980,6 +1048,8 @@ mod tests {
                 read_abort_tx: Some(read_abort_tx),
                 data_rx: None,
                 tx_bytes: 0,
+                recv_fin_at_us: None,
+                last_tx_progress_at_us: 0,
                 recv_state: StreamRecvState::Open,
                 send_state: StreamSendState::Open,
                 flow: FlowControlState::default(),
@@ -1014,7 +1084,7 @@ mod tests {
         );
         let stream_id = 4;
         let (write_tx, mut write_rx) = mpsc::unbounded_channel();
-        let (read_abort_tx, _read_abort_rx) = oneshot::channel();
+        let (read_abort_tx, mut read_abort_rx) = oneshot::channel();
         let (_data_tx, data_rx) = mpsc::channel(1);
 
         state.streams.insert(
@@ -1024,6 +1094,8 @@ mod tests {
                 read_abort_tx: Some(read_abort_tx),
                 data_rx: Some(data_rx),
                 tx_bytes: 0,
+                recv_fin_at_us: None,
+                last_tx_progress_at_us: 0,
                 recv_state: StreamRecvState::Open,
                 send_state: StreamSendState::Open,
                 flow: FlowControlState::default(),
@@ -1039,12 +1111,123 @@ mod tests {
         assert_eq!(stream.recv_state, StreamRecvState::FinReceived);
         assert_eq!(stream.send_state, StreamSendState::Open);
         assert!(
+            stream.read_abort_tx.is_some(),
+            "local TCP read side should not be aborted immediately on remote fin"
+        );
+        assert!(
+            stream.recv_fin_at_us.is_some(),
+            "remote fin timestamp should be recorded for timeout cleanup"
+        );
+        assert!(
             stream.data_rx.is_some(),
             "local TCP read side should stay open after remote fin"
         );
         assert!(
             matches!(write_rx.try_recv(), Ok(StreamWrite::Fin)),
             "expected a TCP fin to be enqueued"
+        );
+        assert!(
+            matches!(read_abort_rx.try_recv(), Err(TryRecvError::Empty)),
+            "read abort should not fire immediately on remote fin"
+        );
+    }
+
+    #[test]
+    fn half_closed_stream_reaped_after_idle_timeout() {
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let data_notify = Arc::new(Notify::new());
+        let acceptor = acceptor::ClientAcceptor::new();
+        let mut state = ClientState::new(
+            command_tx,
+            data_notify,
+            Arc::new(AtomicBool::new(false)),
+            false,
+            acceptor,
+        );
+        let stream_id = 4;
+        let (write_tx, _write_rx) = mpsc::unbounded_channel();
+        let (read_abort_tx, mut read_abort_rx) = oneshot::channel();
+        let (_data_tx, data_rx) = mpsc::channel(1);
+
+        state.streams.insert(
+            stream_id,
+            ClientStream {
+                write_tx,
+                read_abort_tx: Some(read_abort_tx),
+                data_rx: Some(data_rx),
+                tx_bytes: 0,
+                recv_fin_at_us: Some(10_000_000),
+                last_tx_progress_at_us: 10_000_000,
+                recv_state: StreamRecvState::FinReceived,
+                send_state: StreamSendState::Open,
+                flow: FlowControlState::default(),
+            },
+        );
+
+        let reaped = state.reap_stale_half_closed_streams(80_000_000, 60_000_000);
+        assert_eq!(reaped, 1, "stale half-closed stream should be reaped");
+        let stream = state
+            .streams
+            .get(&stream_id)
+            .expect("stream should still be tracked until writer side closes");
+        assert!(
+            stream.read_abort_tx.is_none(),
+            "reader abort channel should be consumed after reaping"
+        );
+        assert!(
+            matches!(read_abort_rx.try_recv(), Ok(())),
+            "read abort should be fired for stale half-closed stream"
+        );
+    }
+
+    #[test]
+    fn half_closed_stream_with_recent_upload_is_not_reaped() {
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let data_notify = Arc::new(Notify::new());
+        let acceptor = acceptor::ClientAcceptor::new();
+        let mut state = ClientState::new(
+            command_tx,
+            data_notify,
+            Arc::new(AtomicBool::new(false)),
+            false,
+            acceptor,
+        );
+        let stream_id = 4;
+        let (write_tx, _write_rx) = mpsc::unbounded_channel();
+        let (read_abort_tx, mut read_abort_rx) = oneshot::channel();
+        let (_data_tx, data_rx) = mpsc::channel(1);
+
+        state.streams.insert(
+            stream_id,
+            ClientStream {
+                write_tx,
+                read_abort_tx: Some(read_abort_tx),
+                data_rx: Some(data_rx),
+                tx_bytes: 0,
+                recv_fin_at_us: Some(10_000_000),
+                last_tx_progress_at_us: 79_000_000,
+                recv_state: StreamRecvState::FinReceived,
+                send_state: StreamSendState::Open,
+                flow: FlowControlState::default(),
+            },
+        );
+
+        let reaped = state.reap_stale_half_closed_streams(100_000_000, 60_000_000);
+        assert_eq!(
+            reaped, 0,
+            "stream should remain while there is recent upload-side activity"
+        );
+        let stream = state
+            .streams
+            .get(&stream_id)
+            .expect("stream should remain tracked");
+        assert!(
+            stream.read_abort_tx.is_some(),
+            "reader abort channel should remain until timeout"
+        );
+        assert!(
+            matches!(read_abort_rx.try_recv(), Err(TryRecvError::Empty)),
+            "read abort should not fire before timeout"
         );
     }
 
@@ -1072,6 +1255,8 @@ mod tests {
                 read_abort_tx: Some(read_abort_tx),
                 data_rx: Some(data_rx),
                 tx_bytes: 0,
+                recv_fin_at_us: None,
+                last_tx_progress_at_us: 0,
                 recv_state: StreamRecvState::Open,
                 send_state: StreamSendState::Open,
                 flow: FlowControlState::default(),
@@ -1124,6 +1309,8 @@ mod tests {
                 read_abort_tx: Some(read_abort_tx),
                 data_rx: None,
                 tx_bytes: 0,
+                recv_fin_at_us: None,
+                last_tx_progress_at_us: 0,
                 recv_state: StreamRecvState::Open,
                 send_state: StreamSendState::FinQueued,
                 flow: FlowControlState::default(),
@@ -1352,6 +1539,8 @@ pub(crate) fn handle_command(
                     read_abort_tx: Some(read_abort_tx),
                     data_rx: Some(data_rx),
                     tx_bytes: 0,
+                    recv_fin_at_us: None,
+                    last_tx_progress_at_us: 0,
                     recv_state: StreamRecvState::Open,
                     send_state: StreamSendState::Open,
                     flow: FlowControlState::default(),
@@ -1418,6 +1607,7 @@ pub(crate) fn handle_command(
             } else if let Some(stream) = state.streams.get_mut(&stream_id) {
                 stream.tx_bytes = stream.tx_bytes.saturating_add(data.len() as u64);
                 let now = unsafe { picoquic_current_time() };
+                stream.last_tx_progress_at_us = now;
                 state.debug_enqueued_bytes =
                     state.debug_enqueued_bytes.saturating_add(data.len() as u64);
                 state.debug_last_enqueue_at = now;

@@ -143,6 +143,13 @@ pub(crate) mod acceptor {
             self.limiter.reset();
         }
 
+        /// Returns (used, max) for diagnostic logging.
+        pub(crate) fn metrics(&self) -> (usize, usize) {
+            let used = self.limiter.used.load(Ordering::SeqCst);
+            let max = self.limiter.max.load(Ordering::SeqCst);
+            (used, max)
+        }
+
         #[cfg(test)]
         pub(crate) fn set_test_limit(limit: usize) {
             TEST_ACCEPTOR_LIMIT.store(limit, Ordering::SeqCst);
@@ -473,6 +480,11 @@ impl ClientState {
             self.acceptor_limit_logged = true;
             info!("acceptor: initial_max_streams_bidir_remote={}", max_streams);
         }
+    }
+
+    /// Returns (used, max) for the acceptor limiter.
+    pub(crate) fn acceptor_metrics(&self) -> (usize, usize) {
+        self.acceptor.metrics()
     }
 
     pub(crate) fn debug_snapshot(&self) -> (u64, u64) {

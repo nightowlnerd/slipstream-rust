@@ -220,6 +220,7 @@ extern "C" {
         quic: *mut picoquic_quic_t,
         alg: *mut picoquic_congestion_algorithm_t,
     );
+    pub fn picoquic_set_default_idle_timeout(quic: *mut picoquic_quic_t, idle_timeout_ms: u64);
     pub fn picoquic_set_default_multipath_option(
         quic: *mut picoquic_quic_t,
         multipath_option: c_int,

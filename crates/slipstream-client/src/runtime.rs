@@ -159,16 +159,16 @@ impl Watchdog {
                         continue;
                     }
                     let stuck_phase = ph.load(Ordering::Relaxed);
-                    if stuck_phase == PHASE_SELECT
-                        && stale_us > WATCHDOG_SELECT_STALE_SECS * 1_000_000
-                    {
-                        eprintln!(
-                            "WATCHDOG: select phase stale for {:.1}s, continuing without abort (phase {}: {})",
-                            stale_us as f64 / 1_000_000.0,
-                            stuck_phase,
-                            phase_name(stuck_phase),
-                        );
-                        hb.store(now_pico, Ordering::Relaxed);
+                    if stuck_phase == PHASE_SELECT {
+                        if stale_us > WATCHDOG_SELECT_STALE_SECS * 1_000_000 {
+                            eprintln!(
+                                "WATCHDOG: select phase stale for {:.1}s, continuing without abort (phase {}: {})",
+                                stale_us as f64 / 1_000_000.0,
+                                stuck_phase,
+                                phase_name(stuck_phase),
+                            );
+                            hb.store(now_pico, Ordering::Relaxed);
+                        }
                         continue;
                     }
                     if stale_us > WATCHDOG_STALE_SECS * 1_000_000 {

@@ -479,6 +479,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 if !refresh_resolver_path(cnx, resolver) {
                     continue;
                 }
+                if !resolver.is_active() {
+                    continue;
+                }
                 let pending_for_sleep = match resolver.mode {
                     ResolverMode::Authoritative => {
                         let quality = fetch_path_quality(cnx, resolver);
@@ -686,7 +689,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         // The server can only send ACKs inside DNS responses,
                         // so we must keep querying to unblock the CWND.
                         for resolver in resolver_manager.as_mut_slice().iter_mut() {
-                            if resolver.mode == ResolverMode::Recursive && resolver.added {
+                            if resolver.is_active()
+                                && resolver.mode == ResolverMode::Recursive
+                                && resolver.added
+                            {
                                 resolver.pending_polls = resolver.pending_polls.max(1);
                             }
                         }
@@ -737,6 +743,21 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
 
+            if let Some((from_index, to_index, reason)) =
+                resolver_manager.maybe_select_active(current_time)
+            {
+                record_resolver_switch(
+                    resolver_manager.as_mut_slice(),
+                    Some(from_index),
+                    to_index,
+                    reason,
+                );
+                unsafe {
+                    let mode = resolver_manager.active().mode;
+                    slipstream_set_default_path_mode(resolver_mode_to_c(mode));
+                }
+            }
+
             let has_ready_stream = unsafe { slipstream_has_ready_stream(cnx) != 0 };
             let flow_blocked = unsafe { slipstream_is_flow_blocked(cnx) != 0 };
             let streams_len = unsafe { (*state_ptr).streams_len() };
@@ -775,6 +796,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             }
             watchdog.set_phase(PHASE_POLL_QUERIES);
             for resolver in resolver_manager.as_mut_slice().iter_mut() {
+                if !resolver.is_active() {
+                    continue;
+                }
                 if !refresh_resolver_path(cnx, resolver) {
                     continue;
                 }

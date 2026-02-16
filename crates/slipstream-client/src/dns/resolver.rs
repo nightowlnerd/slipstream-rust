@@ -97,6 +97,34 @@ impl ResolverManager {
         self.active_index
     }
 
+    pub(crate) fn set_startup_active_index(&mut self, index: usize) {
+        if index >= self.resolvers.len() || index == self.active_index {
+            return;
+        }
+
+        self.active_index = index;
+        for (resolver_index, resolver) in self.resolvers.iter_mut().enumerate() {
+            resolver.role = if resolver_index == index {
+                ResolverRole::Active
+            } else {
+                ResolverRole::Standby
+            };
+            resolver.added = resolver_index == index;
+            resolver.path_id = if resolver_index == index { 0 } else { -1 };
+            resolver.unique_path_id = if resolver_index == index {
+                Some(0)
+            } else {
+                None
+            };
+            resolver.local_addr_storage = None;
+            resolver.pending_polls = 0;
+            resolver.inflight_poll_ids.clear();
+            resolver.last_pacing_snapshot = None;
+            resolver.probe_attempts = 0;
+            resolver.next_probe_at = 0;
+        }
+    }
+
     pub(crate) fn active_mut(&mut self) -> &mut ResolverState {
         &mut self.resolvers[self.active_index]
     }
@@ -394,5 +422,39 @@ mod tests {
         assert_eq!(switch.1, 1);
         assert_eq!(manager.active_index(), 1);
         assert_eq!(manager.active().role, ResolverRole::Active);
+    }
+
+    #[test]
+    fn manager_can_set_startup_active_index() {
+        let resolvers = vec![
+            ResolverSpec {
+                resolver: HostPort {
+                    host: "127.0.0.1".to_string(),
+                    port: 8853,
+                    family: AddressFamily::V4,
+                },
+                mode: ResolverMode::Recursive,
+            },
+            ResolverSpec {
+                resolver: HostPort {
+                    host: "127.0.0.2".to_string(),
+                    port: 8853,
+                    family: AddressFamily::V4,
+                },
+                mode: ResolverMode::Recursive,
+            },
+        ];
+
+        let mut manager = ResolverManager::from_specs(&resolvers, 900, false)
+            .expect("resolver manager should initialize");
+        manager.set_startup_active_index(1);
+
+        assert_eq!(manager.active_index(), 1);
+        assert!(manager.as_slice()[1].added);
+        assert_eq!(manager.as_slice()[1].path_id, 0);
+        assert_eq!(manager.as_slice()[1].unique_path_id, Some(0));
+        assert!(!manager.as_slice()[0].added);
+        assert_eq!(manager.as_slice()[0].path_id, -1);
+        assert_eq!(manager.as_slice()[0].unique_path_id, None);
     }
 }

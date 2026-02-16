@@ -1,3 +1,4 @@
+mod actions;
 mod deadlock;
 mod decision;
 mod health;
@@ -5,6 +6,7 @@ mod loop_policy;
 mod path;
 mod setup;
 
+use self::actions::{poll_authoritative_resolver, poll_recursive_resolver, PollDispatch};
 use self::deadlock::AcceptorSaturationTracker;
 use self::decision::{
     decide_acceptor_deadlock_reconnect, decide_active_path_loss_reconnect, ReconnectReason,
@@ -16,14 +18,14 @@ use self::health::{
 use self::loop_policy::compute_loop_sleep_policy;
 use self::path::{
     apply_path_mode, drain_path_events, fetch_path_quality, find_resolver_by_addr_mut,
-    loop_burst_total, path_poll_burst_max,
+    loop_burst_total,
 };
 use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
 use crate::dns::{
     add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
     record_resolver_switch, refresh_resolver_path, resolver_mode_to_c,
-    resolver_switch_reason_catalog, send_poll_queries, sockaddr_storage_to_socket_addr,
-    DnsResponseContext, ResolverManager, ResolverState, ResolverSwitchReason,
+    resolver_switch_reason_catalog, sockaddr_storage_to_socket_addr, DnsResponseContext,
+    ResolverManager, ResolverState, ResolverSwitchReason,
 };
 use crate::error::ClientError;
 use crate::pacing::{cwnd_target_polls, inflight_packet_estimate};
@@ -57,7 +59,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 // Protocol defaults; see docs/config.md for details.
 const SLIPSTREAM_ALPN: &str = "picoquic_sample";
@@ -932,86 +934,33 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
                 match resolver.mode {
                     ResolverMode::Authoritative => {
-                        let quality = fetch_and_record_path_quality(cnx, resolver);
-                        let snapshot = resolver.last_pacing_snapshot;
-                        let pacing_target = snapshot
-                            .map(|snapshot| snapshot.target_inflight)
-                            .unwrap_or_else(|| cwnd_target_polls(quality.cwin, mtu));
-                        let inflight_packets =
-                            inflight_packet_estimate(quality.bytes_in_transit, mtu);
-                        let mut poll_deficit = pacing_target.saturating_sub(inflight_packets);
-                        // Only suppress polls when the send loop actually produced
-                        // QUIC packets (which act as implicit polls). When CWND is
-                        // full, prepare_next_packet_ex returns nothing—but the server
-                        // can only send ACKs inside DNS responses, so we must keep
-                        // polling to unblock the congestion window.
-                        if has_ready_stream && !flow_blocked && sent_quic_data {
-                            poll_deficit = 0;
-                        }
-                        if poll_deficit > 0 && resolver.debug.enabled {
-                            debug!(
-                                "cc_state: {} cwnd={} in_transit={} rtt_us={} flow_blocked={} deficit={}",
-                                resolver.label(),
-                                quality.cwin,
-                                quality.bytes_in_transit,
-                                quality.rtt,
-                                flow_blocked,
-                                poll_deficit
-                            );
-                        }
-                        if poll_deficit > 0 {
-                            let burst_max = path_poll_burst_max(resolver);
-                            let mut to_send = poll_deficit.min(burst_max);
-                            send_poll_queries(
-                                cnx,
-                                &udp,
-                                config,
-                                &mut local_addr_storage,
-                                &mut dns_id,
-                                resolver,
-                                &mut to_send,
-                                &mut send_buf,
-                            )
-                            .await?;
-                        }
+                        let mut dispatch = PollDispatch {
+                            udp: &udp,
+                            config,
+                            local_addr_storage: &mut local_addr_storage,
+                            dns_id: &mut dns_id,
+                            send_buf: &mut send_buf,
+                        };
+                        poll_authoritative_resolver(
+                            cnx,
+                            &mut dispatch,
+                            resolver,
+                            mtu,
+                            has_ready_stream,
+                            flow_blocked,
+                            sent_quic_data,
+                        )
+                        .await?;
                     }
                     ResolverMode::Recursive => {
-                        resolver.last_pacing_snapshot = None;
-                        if resolver.pending_polls > 0 {
-                            let burst_max = path_poll_burst_max(resolver);
-                            if resolver.pending_polls > burst_max {
-                                let mut to_send = burst_max;
-                                send_poll_queries(
-                                    cnx,
-                                    &udp,
-                                    config,
-                                    &mut local_addr_storage,
-                                    &mut dns_id,
-                                    resolver,
-                                    &mut to_send,
-                                    &mut send_buf,
-                                )
-                                .await?;
-                                resolver.pending_polls = resolver
-                                    .pending_polls
-                                    .saturating_sub(burst_max)
-                                    .saturating_add(to_send);
-                            } else {
-                                let mut pending = resolver.pending_polls;
-                                send_poll_queries(
-                                    cnx,
-                                    &udp,
-                                    config,
-                                    &mut local_addr_storage,
-                                    &mut dns_id,
-                                    resolver,
-                                    &mut pending,
-                                    &mut send_buf,
-                                )
-                                .await?;
-                                resolver.pending_polls = pending;
-                            }
-                        }
+                        let mut dispatch = PollDispatch {
+                            udp: &udp,
+                            config,
+                            local_addr_storage: &mut local_addr_storage,
+                            dns_id: &mut dns_id,
+                            send_buf: &mut send_buf,
+                        };
+                        poll_recursive_resolver(cnx, &mut dispatch, resolver).await?;
                     }
                 }
             }

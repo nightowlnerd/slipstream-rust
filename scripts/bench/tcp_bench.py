@@ -50,28 +50,40 @@ def run_server(args: argparse.Namespace) -> int:
     with socket.create_server((host, port)) as server:
         server.settimeout(args.timeout)
         log_event(log_fp, {"ts": time.time(), "event": "listening", "listen": args.listen, "mode": mode})
-        conn, addr = server.accept()
-        with conn:
-            conn.settimeout(args.timeout)
-            peer = f"{addr[0]}:{addr[1]}"
-            log_event(log_fp, {"ts": time.time(), "event": "accept", "peer": peer, "mode": mode})
-            total = 0
-            start = None
-            first_payload_ts = None
-            last_payload_ts = None
-            if mode == "sink":
-                while True:
-                    data = conn.recv(args.chunk_size)
-                    if not data:
-                        break
-                    if first_payload_ts is None:
-                        first_payload_ts = time.time()
-                        start = time.perf_counter()
-                    total += len(data)
-                    last_payload_ts = time.time()
-                    if args.bytes and total >= args.bytes:
-                        break
-            else:
+
+        total = 0
+        start = None
+        first_payload_ts = None
+        last_payload_ts = None
+
+        if mode == "sink":
+            while True:
+                conn, addr = server.accept()
+                with conn:
+                    conn.settimeout(args.timeout)
+                    peer = f"{addr[0]}:{addr[1]}"
+                    log_event(log_fp, {"ts": time.time(), "event": "accept", "peer": peer, "mode": mode})
+                    while True:
+                        data = conn.recv(args.chunk_size)
+                        if not data:
+                            break
+                        if first_payload_ts is None:
+                            first_payload_ts = time.time()
+                            start = time.perf_counter()
+                        total += len(data)
+                        last_payload_ts = time.time()
+                        if args.bytes and total >= args.bytes:
+                            break
+                if args.bytes and total >= args.bytes:
+                    break
+                if not args.bytes:
+                    break
+        else:
+            conn, addr = server.accept()
+            with conn:
+                conn.settimeout(args.timeout)
+                peer = f"{addr[0]}:{addr[1]}"
+                log_event(log_fp, {"ts": time.time(), "event": "accept", "peer": peer, "mode": mode})
                 remaining_preface = args.preface_bytes
                 while remaining_preface > 0:
                     data = conn.recv(min(args.chunk_size, remaining_preface))
@@ -89,22 +101,23 @@ def run_server(args: argparse.Namespace) -> int:
                     last_payload_ts = time.time()
                     remaining -= send_len
                 total = args.bytes
-            elapsed = time.perf_counter() - start if start is not None else 0.0
-            log_event(
-                log_fp,
-                {
-                    "ts": time.time(),
-                    "event": "done",
-                    "mode": mode,
-                    "bytes": total,
-                    "secs": elapsed,
-                    "first_payload_ts": first_payload_ts,
-                    "last_payload_ts": last_payload_ts,
-                },
-            )
-            summarize(f"server {mode}", total, elapsed)
-            if mode == "source" and args.linger_secs > 0:
-                time.sleep(args.linger_secs)
+
+        elapsed = time.perf_counter() - start if start is not None else 0.0
+        log_event(
+            log_fp,
+            {
+                "ts": time.time(),
+                "event": "done",
+                "mode": mode,
+                "bytes": total,
+                "secs": elapsed,
+                "first_payload_ts": first_payload_ts,
+                "last_payload_ts": last_payload_ts,
+            },
+        )
+        summarize(f"server {mode}", total, elapsed)
+        if mode == "source" and args.linger_secs > 0:
+            time.sleep(args.linger_secs)
 
     if log_fp is not sys.stdout:
         log_fp.close()

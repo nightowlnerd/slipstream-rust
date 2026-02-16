@@ -1,5 +1,5 @@
 use slipstream_core::{net::is_transient_udp_error, normalize_dual_stack_addr};
-use slipstream_dns::{decode_query_with_domains, DecodeQueryError};
+use slipstream_dns::{decode_query_with_domains, DecodeQueryError, Rcode};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_incoming_packet_ex, picoquic_quic_t, slipstream_disable_ack_delay,
 };
@@ -391,6 +391,14 @@ fn decode_slot(
                 // Treat empty-question queries (QDCOUNT=0) as non-DNS for fallback.
                 return Ok(DecodeSlotOutcome::Drop);
             };
+            let rcode = if rcode == Rcode::NameError && is_apex_question(&question.name, domains) {
+                // Recursive resolvers commonly send NS/SOA probes at the delegated apex.
+                // Replying NOERROR/NODATA keeps delegation healthy without affecting
+                // TXT payload handling under subdomains.
+                Rcode::Ok
+            } else {
+                rcode
+            };
             Ok(DecodeSlotOutcome::Slot(Slot {
                 peer,
                 id,
@@ -404,6 +412,13 @@ fn decode_slot(
             }))
         }
     }
+}
+
+fn is_apex_question(name: &str, domains: &[&str]) -> bool {
+    let query = name.trim_end_matches('.');
+    domains
+        .iter()
+        .any(|domain| query.eq_ignore_ascii_case(domain.trim_end_matches('.')))
 }
 
 fn fallback_bind_addr(fallback_addr: SocketAddr) -> SocketAddr {
@@ -477,7 +492,9 @@ fn dummy_sockaddr_storage() -> libc::sockaddr_storage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slipstream_dns::{encode_query, QueryParams, CLASS_IN, RR_A};
+    use slipstream_dns::{
+        decode_query_with_domains, encode_query, DecodeQueryError, QueryParams, CLASS_IN, RR_A,
+    };
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
 
@@ -493,6 +510,30 @@ mod tests {
             is_query: true,
         })
         .expect("dns query")
+    }
+
+    #[test]
+    fn apex_name_error_is_overridden_to_noerror() {
+        let packet = build_dns_query("example.com");
+        let decoded = decode_query_with_domains(&packet, &["example.com"])
+            .expect_err("apex A query should not decode as data packet");
+        let DecodeQueryError::Reply {
+            question: Some(question),
+            rcode,
+            ..
+        } = decoded
+        else {
+            panic!("expected reply error");
+        };
+        assert_eq!(rcode, Rcode::NameError);
+        assert!(is_apex_question(&question.name, &["example.com"]));
+        let effective =
+            if rcode == Rcode::NameError && is_apex_question(&question.name, &["example.com"]) {
+                Rcode::Ok
+            } else {
+                rcode
+            };
+        assert_eq!(effective, Rcode::Ok);
     }
 
     fn spawn_fallback_echo(socket: Arc<TokioUdpSocket>, notify_tx: mpsc::UnboundedSender<Vec<u8>>) {

@@ -544,6 +544,11 @@ run_client_bench() {
     stop_target
     return 1
   fi
+  if ! wait_for_log "Rust client (${label}) ready" "${client_log}" "Connection ready"; then
+    stop_client
+    stop_target
+    return 1
+  fi
   if ! run_bench_client "${label}" "${client_mode}" "${preface_bytes}"; then
     stop_client
     stop_target

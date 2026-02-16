@@ -72,6 +72,7 @@ const ACCEPTOR_SATURATED_TIMEOUT_US: u64 = 30_000_000;
 const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
 const WATCHDOG_STALE_SECS: u64 = 15;
 const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+const ACTIVE_PATH_LOSS_RECONNECT_STREAMS: usize = 32;
 
 /// Watchdog that runs on a separate OS thread (not tokio) to detect when the
 /// single-threaded tokio runtime freezes (e.g. a picoquic C FFI call hangs).
@@ -208,6 +209,27 @@ fn drain_disconnected_commands(command_rx: &mut mpsc::UnboundedReceiver<Command>
         }
     }
     dropped
+}
+
+fn maybe_switch_active_resolver(
+    resolver_manager: &mut ResolverManager,
+    current_time: u64,
+    preferred_startup_resolver_index: &mut usize,
+) {
+    if let Some((from_index, to_index, reason)) = resolver_manager.maybe_select_active(current_time)
+    {
+        *preferred_startup_resolver_index = to_index;
+        record_resolver_switch(
+            resolver_manager.as_mut_slice(),
+            Some(from_index),
+            to_index,
+            reason,
+        );
+        unsafe {
+            let mode = resolver_manager.active().mode;
+            slipstream_set_default_path_mode(resolver_mode_to_c(mode));
+        }
+    }
 }
 
 pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
@@ -458,7 +480,23 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     }
                 }
             }
-            drain_path_events(cnx, resolver_manager.as_mut_slice(), state_ptr);
+            let active_path_deleted =
+                drain_path_events(cnx, resolver_manager.as_mut_slice(), state_ptr);
+            if active_path_deleted {
+                maybe_switch_active_resolver(
+                    &mut resolver_manager,
+                    current_time,
+                    &mut preferred_startup_resolver_index,
+                );
+                let streams_len = unsafe { (*state_ptr).streams_len() };
+                if streams_len >= ACTIVE_PATH_LOSS_RECONNECT_STREAMS {
+                    warn!(
+                        "active resolver path deleted with {} streams; reconnecting to limit reset storm",
+                        streams_len
+                    );
+                    break;
+                }
+            }
 
             for resolver in resolver_manager.as_mut_slice().iter_mut() {
                 if resolver.mode == ResolverMode::Authoritative {
@@ -598,7 +636,23 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 let _ = drain_disconnected_commands(&mut command_rx);
             }
             drain_stream_data(cnx, state_ptr);
-            drain_path_events(cnx, resolver_manager.as_mut_slice(), state_ptr);
+            let active_path_deleted =
+                drain_path_events(cnx, resolver_manager.as_mut_slice(), state_ptr);
+            if active_path_deleted {
+                maybe_switch_active_resolver(
+                    &mut resolver_manager,
+                    current_time,
+                    &mut preferred_startup_resolver_index,
+                );
+                let streams_len = unsafe { (*state_ptr).streams_len() };
+                if streams_len >= ACTIVE_PATH_LOSS_RECONNECT_STREAMS {
+                    warn!(
+                        "active resolver path deleted with {} streams; reconnecting to limit reset storm",
+                        streams_len
+                    );
+                    break;
+                }
+            }
             let reaped_half_closed = unsafe {
                 let now = picoquic_current_time();
                 (*state_ptr).reap_stale_half_closed_streams(now, HALF_CLOSE_IDLE_TIMEOUT_US)
@@ -747,21 +801,11 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
 
-            if let Some((from_index, to_index, reason)) =
-                resolver_manager.maybe_select_active(current_time)
-            {
-                preferred_startup_resolver_index = to_index;
-                record_resolver_switch(
-                    resolver_manager.as_mut_slice(),
-                    Some(from_index),
-                    to_index,
-                    reason,
-                );
-                unsafe {
-                    let mode = resolver_manager.active().mode;
-                    slipstream_set_default_path_mode(resolver_mode_to_c(mode));
-                }
-            }
+            maybe_switch_active_resolver(
+                &mut resolver_manager,
+                current_time,
+                &mut preferred_startup_resolver_index,
+            );
 
             let has_ready_stream = unsafe { slipstream_has_ready_stream(cnx) != 0 };
             let flow_blocked = unsafe { slipstream_is_flow_blocked(cnx) != 0 };

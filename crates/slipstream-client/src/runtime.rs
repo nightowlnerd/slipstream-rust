@@ -8,8 +8,8 @@ use self::path::{
 use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
 use crate::dns::{
     add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
-    record_resolver_switch, refresh_resolver_path, resolve_resolvers, resolver_mode_to_c,
-    send_poll_queries, sockaddr_storage_to_socket_addr, DnsResponseContext, ResolverSwitchReason,
+    record_resolver_switch, refresh_resolver_path, resolver_mode_to_c, send_poll_queries,
+    sockaddr_storage_to_socket_addr, DnsResponseContext, ResolverManager, ResolverSwitchReason,
 };
 use crate::error::ClientError;
 use crate::pacing::{cwnd_target_polls, inflight_packet_estimate};
@@ -274,14 +274,13 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     let mut reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
 
     loop {
-        let mut resolvers = resolve_resolvers(config.resolvers, mtu, config.debug_poll)?;
-        if resolvers.is_empty() {
-            return Err(ClientError::new("At least one resolver is required"));
-        }
+        let mut resolver_manager =
+            ResolverManager::from_specs(config.resolvers, mtu, config.debug_poll)?;
+        let active_index = resolver_manager.active_index();
         record_resolver_switch(
-            &mut resolvers,
+            resolver_manager.as_mut_slice(),
             None,
-            0,
+            active_index,
             ResolverSwitchReason::StartupPrimary,
         );
 
@@ -326,7 +325,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             configure_quic_with_custom(quic, mixed_cc, mtu);
             // Multipath is only useful with multiple resolvers; leave it off
             // (picoquic default) for single-resolver to avoid CID exhaustion.
-            if resolvers.len() > 1 {
+            if resolver_manager.as_slice().len() > 1 {
                 picoquic_set_default_multipath_option(quic, 1);
                 // Multipath provisions 8 CIDs per path; the default limit of 8
                 // is too low with 2+ paths.  32 accommodates ~7 paths.
@@ -340,12 +339,14 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             slipstream_set_cc_override(override_ptr);
         }
         unsafe {
-            slipstream_set_default_path_mode(resolver_mode_to_c(resolvers[0].mode));
+            slipstream_set_default_path_mode(resolver_mode_to_c(
+                resolver_manager.active_mut().mode,
+            ));
         }
         if let Some(cert) = config.cert {
             configure_pinned_certificate(quic, cert).map_err(ClientError::new)?;
         }
-        let mut server_storage = resolvers[0].storage;
+        let mut server_storage = resolver_manager.active_mut().storage;
         // picoquic_create_client_cnx calls picoquic_start_client_cnx internally (see picoquic/quicctx.c).
         let cnx = unsafe {
             picoquic_create_client_cnx(
@@ -363,7 +364,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             return Err(ClientError::new("Could not create QUIC connection"));
         }
 
-        apply_path_mode(cnx, &mut resolvers[0])?;
+        apply_path_mode(cnx, resolver_manager.active_mut())?;
 
         unsafe {
             picoquic_set_callback(cnx, Some(client_callback), state_ptr as *mut _);
@@ -383,8 +384,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut dns_id = 1u16;
         let mut recv_buf = vec![0u8; 4096];
         let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
-        let packet_loop_send_max = loop_burst_total(&resolvers, PICOQUIC_PACKET_LOOP_SEND_MAX);
-        let packet_loop_recv_max = loop_burst_total(&resolvers, PICOQUIC_PACKET_LOOP_RECV_MAX);
+        let packet_loop_send_max =
+            loop_burst_total(resolver_manager.as_slice(), PICOQUIC_PACKET_LOOP_SEND_MAX);
+        let packet_loop_recv_max =
+            loop_burst_total(resolver_manager.as_slice(), PICOQUIC_PACKET_LOOP_RECV_MAX);
         let mut zero_send_loops = 0u64;
         let mut zero_send_with_streams = 0u64;
         let mut data_ready_skips = 0u64;
@@ -444,16 +447,16 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 if reconnect_delay != Duration::from_millis(RECONNECT_SLEEP_MIN_MS) {
                     reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
                 }
-                add_paths(cnx, &mut resolvers)?;
-                for resolver in resolvers.iter_mut() {
+                add_paths(cnx, resolver_manager.as_mut_slice())?;
+                for resolver in resolver_manager.as_mut_slice().iter_mut() {
                     if resolver.added {
                         apply_path_mode(cnx, resolver)?;
                     }
                 }
             }
-            drain_path_events(cnx, &mut resolvers, state_ptr);
+            drain_path_events(cnx, resolver_manager.as_mut_slice(), state_ptr);
 
-            for resolver in resolvers.iter_mut() {
+            for resolver in resolver_manager.as_mut_slice().iter_mut() {
                 if resolver.mode == ResolverMode::Authoritative {
                     let expired =
                         expire_inflight_polls(&mut resolver.inflight_poll_ids, current_time);
@@ -472,7 +475,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             let delay_us = if delay_us < 0 { 0 } else { delay_us as u64 };
             let streams_len_for_sleep = unsafe { (*state_ptr).streams_len() };
             let mut has_work = streams_len_for_sleep > 0;
-            for resolver in resolvers.iter_mut() {
+            for resolver in resolver_manager.as_mut_slice().iter_mut() {
                 if !refresh_resolver_path(cnx, resolver) {
                     continue;
                 }
@@ -541,7 +544,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                                 let mut response_ctx = DnsResponseContext {
                                     quic,
                                     local_addr_storage: &local_addr_storage,
-                                    resolvers: &mut resolvers,
+                                    resolvers: resolver_manager.as_mut_slice(),
                                 };
                                 handle_dns_response(&recv_buf[..size], peer, &mut response_ctx)?;
                                 for _ in 1..packet_loop_recv_max {
@@ -588,7 +591,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 let _ = drain_disconnected_commands(&mut command_rx);
             }
             drain_stream_data(cnx, state_ptr);
-            drain_path_events(cnx, &mut resolvers, state_ptr);
+            drain_path_events(cnx, resolver_manager.as_mut_slice(), state_ptr);
             let reaped_half_closed = unsafe {
                 let now = picoquic_current_time();
                 (*state_ptr).reap_stale_half_closed_streams(now, HALF_CLOSE_IDLE_TIMEOUT_US)
@@ -682,7 +685,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         // congestion window is full (not just flow control).
                         // The server can only send ACKs inside DNS responses,
                         // so we must keep querying to unblock the CWND.
-                        for resolver in resolvers.iter_mut() {
+                        for resolver in resolver_manager.as_mut_slice().iter_mut() {
                             if resolver.mode == ResolverMode::Recursive && resolver.added {
                                 resolver.pending_polls = resolver.pending_polls.max(1);
                             }
@@ -697,7 +700,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 sent_quic_data = true;
                 if let Ok(dest) = sockaddr_storage_to_socket_addr(&addr_to) {
                     let dest = normalize_dual_stack_addr(dest);
-                    if let Some(resolver) = find_resolver_by_addr_mut(&mut resolvers, dest) {
+                    if let Some(resolver) =
+                        find_resolver_by_addr_mut(resolver_manager.as_mut_slice(), dest)
+                    {
                         resolver.local_addr_storage = Some(unsafe { std::ptr::read(&addr_from) });
                         resolver.debug.send_packets = resolver.debug.send_packets.saturating_add(1);
                         resolver.debug.send_bytes =
@@ -769,7 +774,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
             watchdog.set_phase(PHASE_POLL_QUERIES);
-            for resolver in resolvers.iter_mut() {
+            for resolver in resolver_manager.as_mut_slice().iter_mut() {
                 if !refresh_resolver_path(cnx, resolver) {
                     continue;
                 }
@@ -887,7 +892,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             let report_time = unsafe { picoquic_current_time() };
             let (enqueued_bytes, last_enqueue_at) = unsafe { (*state_ptr).debug_snapshot() };
             let streams_len = unsafe { (*state_ptr).streams_len() };
-            for resolver in resolvers.iter_mut() {
+            for resolver in resolver_manager.as_mut_slice().iter_mut() {
                 resolver.debug.enqueued_bytes = enqueued_bytes;
                 resolver.debug.last_enqueue_at = last_enqueue_at;
                 resolver.debug.zero_send_loops = zero_send_loops;

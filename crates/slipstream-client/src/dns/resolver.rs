@@ -9,6 +9,11 @@ use tracing::warn;
 
 use super::debug::DebugMetrics;
 
+pub(crate) struct ResolverManager {
+    resolvers: Vec<ResolverState>,
+    active_index: usize,
+}
+
 pub(crate) struct ResolverState {
     pub(crate) addr: SocketAddr,
     pub(crate) storage: libc::sockaddr_storage,
@@ -33,6 +38,56 @@ impl ResolverState {
             "path_id={} unique_id={:?} resolver={} mode={:?} role={:?}",
             self.path_id, self.unique_path_id, self.addr, self.mode, self.role
         )
+    }
+}
+
+impl ResolverManager {
+    pub(crate) fn from_specs(
+        resolvers: &[ResolverSpec],
+        mtu: u32,
+        debug_poll: bool,
+    ) -> Result<Self, ClientError> {
+        let resolved = resolve_resolvers(resolvers, mtu, debug_poll)?;
+        Self::new(resolved)
+    }
+
+    fn new(mut resolvers: Vec<ResolverState>) -> Result<Self, ClientError> {
+        if resolvers.is_empty() {
+            return Err(ClientError::new("At least one resolver is required"));
+        }
+
+        let active_index = resolvers
+            .iter()
+            .position(|resolver| resolver.role == ResolverRole::Active)
+            .unwrap_or(0);
+        for (index, resolver) in resolvers.iter_mut().enumerate() {
+            resolver.role = if index == active_index {
+                ResolverRole::Active
+            } else {
+                ResolverRole::Standby
+            };
+        }
+
+        Ok(Self {
+            resolvers,
+            active_index,
+        })
+    }
+
+    pub(crate) fn active_index(&self) -> usize {
+        self.active_index
+    }
+
+    pub(crate) fn active_mut(&mut self) -> &mut ResolverState {
+        &mut self.resolvers[self.active_index]
+    }
+
+    pub(crate) fn as_slice(&self) -> &[ResolverState] {
+        &self.resolvers
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [ResolverState] {
+        &mut self.resolvers
     }
 }
 
@@ -107,7 +162,8 @@ pub(crate) fn sockaddr_storage_to_socket_addr(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_resolvers;
+    use super::{resolve_resolvers, ResolverManager};
+    use slipstream_core::state_machine::ResolverRole;
     use slipstream_core::{AddressFamily, HostPort};
     use slipstream_ffi::{ResolverMode, ResolverSpec};
 
@@ -136,5 +192,34 @@ mod tests {
             Ok(_) => panic!("expected duplicate resolver error"),
             Err(err) => assert!(err.to_string().contains("Duplicate resolver address")),
         }
+    }
+
+    #[test]
+    fn manager_tracks_single_active_resolver() {
+        let resolvers = vec![
+            ResolverSpec {
+                resolver: HostPort {
+                    host: "127.0.0.1".to_string(),
+                    port: 8853,
+                    family: AddressFamily::V4,
+                },
+                mode: ResolverMode::Recursive,
+            },
+            ResolverSpec {
+                resolver: HostPort {
+                    host: "127.0.0.2".to_string(),
+                    port: 8853,
+                    family: AddressFamily::V4,
+                },
+                mode: ResolverMode::Authoritative,
+            },
+        ];
+
+        let manager = ResolverManager::from_specs(&resolvers, 900, false)
+            .expect("resolver manager should initialize");
+
+        assert_eq!(manager.active_index(), 0);
+        assert_eq!(manager.as_slice()[0].role, ResolverRole::Active);
+        assert_eq!(manager.as_slice()[1].role, ResolverRole::Standby);
     }
 }

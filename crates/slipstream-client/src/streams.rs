@@ -620,6 +620,10 @@ impl ClientState {
         std::mem::take(&mut self.path_events)
     }
 
+    pub(crate) fn clear_closing(&mut self) {
+        self.closing = false;
+    }
+
     pub(crate) fn reset_for_reconnect(&mut self) {
         let debug_streams = self.debug_streams;
         for (stream_id, mut stream) in self.streams.drain() {

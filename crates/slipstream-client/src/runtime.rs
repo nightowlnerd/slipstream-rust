@@ -660,7 +660,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 (*state_ptr).reap_stale_half_closed_streams(now, HALF_CLOSE_IDLE_TIMEOUT_US)
             };
             if reaped_half_closed > 0 {
-                warn!(
+                info!(
                     "reaped {} stale half-closed stream(s) after {}s idle timeout",
                     reaped_half_closed,
                     HALF_CLOSE_IDLE_TIMEOUT_US / 1_000_000

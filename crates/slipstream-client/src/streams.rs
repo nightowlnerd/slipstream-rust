@@ -534,7 +534,7 @@ impl ClientState {
                 let idle_since = fin_at.max(stream.last_tx_progress_at_us);
                 let idle_secs = now_us.saturating_sub(idle_since) as f64 / 1_000_000.0;
                 let _ = read_abort_tx.send(());
-                warn!(
+                info!(
                     "stream {}: stale half-close idle for {:.1}s; aborting local reader (rx_bytes={} tx_bytes={} queued={} recv_state={:?} send_state={:?})",
                     stream_id,
                     idle_secs,
@@ -819,7 +819,7 @@ pub(crate) unsafe extern "C" fn client_callback(
                     stream.send_state
                 );
             } else {
-                warn!(
+                debug!(
                     "stream {}: reset event={} (unknown stream)",
                     stream_id, reason
                 );
@@ -1679,7 +1679,7 @@ pub(crate) fn handle_command(
                     stream.flow.fin_offset
                 );
             } else {
-                warn!("stream {}: tcp read error (unknown stream)", stream_id);
+                debug!("stream {}: tcp read error (unknown stream)", stream_id);
             }
             unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
         }
@@ -1695,7 +1695,7 @@ pub(crate) fn handle_command(
                     stream.flow.fin_offset
                 );
             } else {
-                warn!("stream {}: tcp write error (unknown stream)", stream_id);
+                debug!("stream {}: tcp write error (unknown stream)", stream_id);
             }
             unsafe { abort_stream_bidi(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR) };
         }

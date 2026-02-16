@@ -11,6 +11,7 @@ use super::resolver::{reset_resolver_path, ResolverState};
 
 const PATH_PROBE_INITIAL_DELAY_US: u64 = 250_000;
 const PATH_PROBE_MAX_DELAY_US: u64 = 10_000_000;
+const PROBE_FAILURE_LOG_INTERVAL_US: u64 = 10_000_000;
 
 pub(crate) fn refresh_resolver_path(
     cnx: *mut picoquic_cnx_t,
@@ -23,6 +24,7 @@ pub(crate) fn refresh_resolver_path(
             if resolver.path_id != path_id {
                 resolver.path_id = path_id;
             }
+            resolver.last_path_unavailable_log_at = 0;
             return true;
         }
         resolver.unique_path_id = None;
@@ -40,6 +42,7 @@ pub(crate) fn refresh_resolver_path(
     if resolver.path_id != path_id {
         resolver.path_id = path_id;
     }
+    resolver.last_path_unavailable_log_at = 0;
     true
 }
 
@@ -86,6 +89,7 @@ pub(crate) fn add_paths(
         if ret == 0 && path_id >= 0 {
             resolver.added = true;
             resolver.path_id = path_id;
+            resolver.last_probe_failure_log_at = 0;
             resolver.debug.path_probe_successes =
                 resolver.debug.path_probe_successes.saturating_add(1);
             info!("Added path {}", resolver.addr);
@@ -95,12 +99,20 @@ pub(crate) fn add_paths(
         resolver.probe_attempts = resolver.probe_attempts.saturating_add(1);
         let delay = path_probe_backoff(resolver.probe_attempts);
         resolver.next_probe_at = now.saturating_add(delay);
-        warn!(
-            "Failed adding path {} (attempt {}), retrying in {}ms",
-            resolver.addr,
-            resolver.probe_attempts,
-            delay / 1000
-        );
+        let should_log = resolver.probe_attempts == 1
+            || resolver.probe_attempts.is_power_of_two()
+            || resolver.last_probe_failure_log_at == 0
+            || now.saturating_sub(resolver.last_probe_failure_log_at)
+                >= PROBE_FAILURE_LOG_INTERVAL_US;
+        if should_log {
+            resolver.last_probe_failure_log_at = now;
+            warn!(
+                "Failed adding path {} (attempt {}), retrying in {}ms",
+                resolver.addr,
+                resolver.probe_attempts,
+                delay / 1000
+            );
+        }
     }
 
     if default_mode != primary_mode {

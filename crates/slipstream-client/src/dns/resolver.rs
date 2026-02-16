@@ -2,6 +2,7 @@ use crate::error::ClientError;
 use crate::pacing::{PacingBudgetSnapshot, PacingPollBudget};
 use slipstream_core::state_machine::ResolverRole;
 use slipstream_core::{normalize_dual_stack_addr, resolve_host_port};
+use slipstream_ffi::picoquic::picoquic_current_time;
 use slipstream_ffi::{socket_addr_to_storage, ResolverMode, ResolverSpec};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -17,6 +18,7 @@ const SCORE_UNAVAILABLE_PENALTY: u64 = 2_000_000;
 const SCORE_TIMEOUT_PENALTY: u64 = 50_000;
 const SCORE_PROBE_FAILURE_PENALTY: u64 = 20_000;
 const SCORE_STICKINESS_BIAS: u64 = 10_000;
+const PATH_UNAVAILABLE_LOG_INTERVAL_US: u64 = 5_000_000;
 
 pub(crate) struct ResolverManager {
     resolvers: Vec<ResolverState>,
@@ -37,6 +39,8 @@ pub(crate) struct ResolverState {
     pub(crate) unique_path_id: Option<u64>,
     pub(crate) probe_attempts: u32,
     pub(crate) next_probe_at: u64,
+    pub(crate) last_probe_failure_log_at: u64,
+    pub(crate) last_path_unavailable_log_at: u64,
     pub(crate) pending_polls: usize,
     pub(crate) inflight_poll_ids: HashMap<u16, u64>,
     pub(crate) pacing_budget: Option<PacingPollBudget>,
@@ -287,6 +291,8 @@ pub(crate) fn resolve_resolvers(
             unique_path_id: if is_primary { Some(0) } else { None },
             probe_attempts: 0,
             next_probe_at: 0,
+            last_probe_failure_log_at: 0,
+            last_path_unavailable_log_at: 0,
             pending_polls: 0,
             inflight_poll_ids: HashMap::new(),
             pacing_budget: match resolver.mode {
@@ -301,10 +307,17 @@ pub(crate) fn resolve_resolvers(
 }
 
 pub(crate) fn reset_resolver_path(resolver: &mut ResolverState) {
-    warn!(
-        "Path for resolver {} became unavailable; resetting state",
-        resolver.addr
-    );
+    let now = unsafe { picoquic_current_time() };
+    if resolver.last_path_unavailable_log_at == 0
+        || now.saturating_sub(resolver.last_path_unavailable_log_at)
+            >= PATH_UNAVAILABLE_LOG_INTERVAL_US
+    {
+        resolver.last_path_unavailable_log_at = now;
+        warn!(
+            "Path for resolver {} became unavailable; resetting state",
+            resolver.addr
+        );
+    }
     resolver.added = false;
     resolver.path_id = -1;
     resolver.unique_path_id = None;

@@ -72,6 +72,7 @@ const ACCEPTOR_SATURATED_TIMEOUT_US: u64 = 30_000_000;
 const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
 const WATCHDOG_STALE_SECS: u64 = 15;
 const WATCHDOG_SELECT_STALE_SECS: u64 = 45;
+const WATCHDOG_SELECT_STALE_MAX_STRIKES: u32 = 3;
 const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 const ACTIVE_PATH_LOSS_RECONNECT_STREAMS: usize = 32;
 
@@ -125,6 +126,7 @@ impl Watchdog {
             .name("watchdog".into())
             .spawn(move || {
                 let mut last_check = Instant::now();
+                let mut select_stale_strikes = 0u32;
                 while al.load(Ordering::Relaxed) {
                     std::thread::sleep(WATCHDOG_CHECK_INTERVAL);
                     if !al.load(Ordering::Relaxed) {
@@ -161,16 +163,30 @@ impl Watchdog {
                     let stuck_phase = ph.load(Ordering::Relaxed);
                     if stuck_phase == PHASE_SELECT {
                         if stale_us > WATCHDOG_SELECT_STALE_SECS * 1_000_000 {
+                            select_stale_strikes =
+                                select_stale_strikes.saturating_add(1);
                             eprintln!(
-                                "WATCHDOG: select phase stale for {:.1}s, continuing without abort (phase {}: {})",
+                                "WATCHDOG: select phase stale for {:.1}s, continuing without abort (phase {}: {}, strikes={}/{})",
                                 stale_us as f64 / 1_000_000.0,
                                 stuck_phase,
                                 phase_name(stuck_phase),
+                                select_stale_strikes,
+                                WATCHDOG_SELECT_STALE_MAX_STRIKES,
                             );
+                            if select_stale_strikes >= WATCHDOG_SELECT_STALE_MAX_STRIKES {
+                                eprintln!(
+                                    "WATCHDOG: select phase stale persisted for {} checks; aborting process for restart",
+                                    select_stale_strikes,
+                                );
+                                std::process::abort();
+                            }
                             hb.store(now_pico, Ordering::Relaxed);
+                        } else {
+                            select_stale_strikes = 0;
                         }
                         continue;
                     }
+                    select_stale_strikes = 0;
                     if stale_us > WATCHDOG_STALE_SECS * 1_000_000 {
                         eprintln!(
                             "WATCHDOG: main loop stalled for {:.1}s at phase {} ({}), aborting process",

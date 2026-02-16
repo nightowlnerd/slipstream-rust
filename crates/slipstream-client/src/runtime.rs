@@ -274,10 +274,12 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     let _state = state;
 
     let mut reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
+    let mut preferred_startup_resolver_index = 0usize;
 
     loop {
         let mut resolver_manager =
             ResolverManager::from_specs(config.resolvers, mtu, config.debug_poll)?;
+        resolver_manager.set_startup_active_index(preferred_startup_resolver_index);
         let active_index = resolver_manager.active_index();
         record_resolver_switch(
             resolver_manager.as_mut_slice(),
@@ -748,6 +750,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             if let Some((from_index, to_index, reason)) =
                 resolver_manager.maybe_select_active(current_time)
             {
+                preferred_startup_resolver_index = to_index;
                 record_resolver_switch(
                     resolver_manager.as_mut_slice(),
                     Some(from_index),

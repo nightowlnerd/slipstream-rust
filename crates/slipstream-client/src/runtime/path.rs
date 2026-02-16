@@ -51,14 +51,15 @@ pub(crate) fn drain_path_events(
     cnx: *mut picoquic_cnx_t,
     resolvers: &mut [ResolverState],
     state_ptr: *mut ClientState,
-) {
+) -> bool {
     if state_ptr.is_null() {
-        return;
+        return false;
     }
     let events = unsafe { (*state_ptr).take_path_events() };
     if events.is_empty() {
-        return;
+        return false;
     }
+    let mut active_path_deleted = false;
     for event in events {
         match event {
             PathEvent::Available(unique_path_id) => {
@@ -78,11 +79,16 @@ pub(crate) fn drain_path_events(
             }
             PathEvent::Deleted(unique_path_id) => {
                 if let Some(resolver) = find_resolver_by_unique_id_mut(resolvers, unique_path_id) {
+                    if resolver.is_active() {
+                        active_path_deleted = true;
+                    }
                     reset_resolver_path(resolver);
                 }
             }
         }
     }
+
+    active_path_deleted
 }
 
 fn path_peer_addr(cnx: *mut picoquic_cnx_t, unique_path_id: u64) -> Option<SocketAddr> {

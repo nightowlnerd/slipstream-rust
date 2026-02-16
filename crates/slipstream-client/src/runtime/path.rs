@@ -1,14 +1,15 @@
 use crate::dns::{
-    refresh_resolver_path, reset_resolver_path, resolver_mode_to_c,
-    sockaddr_storage_to_socket_addr, ResolverState,
+    record_resolver_switch, refresh_resolver_path, reset_resolver_path, resolver_mode_to_c,
+    sockaddr_storage_to_socket_addr, ResolverManager, ResolverState,
 };
 use crate::error::ClientError;
 use crate::streams::{ClientState, PathEvent};
 use slipstream_core::normalize_dual_stack_addr;
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_get_default_path_quality, picoquic_get_path_addr,
-    picoquic_get_path_quality, slipstream_get_path_id_from_unique, slipstream_set_path_ack_delay,
-    slipstream_set_path_mode, PICOQUIC_PACKET_LOOP_SEND_MAX,
+    picoquic_get_path_quality, slipstream_get_path_id_from_unique,
+    slipstream_set_default_path_mode, slipstream_set_path_ack_delay, slipstream_set_path_mode,
+    PICOQUIC_PACKET_LOOP_SEND_MAX,
 };
 use slipstream_ffi::ResolverMode;
 use std::net::SocketAddr;
@@ -45,6 +46,39 @@ pub(crate) fn fetch_path_quality(
         }
     }
     quality
+}
+
+pub(crate) fn fetch_and_record_path_quality(
+    cnx: *mut picoquic_cnx_t,
+    resolver: &mut ResolverState,
+) -> slipstream_ffi::picoquic::picoquic_path_quality_t {
+    let quality = fetch_path_quality(cnx, resolver);
+    resolver.debug.path_rtt_us = quality.rtt;
+    resolver.debug.path_cwnd = quality.cwin;
+    resolver.debug.path_bytes_in_transit = quality.bytes_in_transit;
+    resolver.debug.path_pacing_rate = quality.pacing_rate;
+    quality
+}
+
+pub(crate) fn maybe_switch_active_resolver(
+    resolver_manager: &mut ResolverManager,
+    current_time: u64,
+    preferred_startup_resolver_index: &mut usize,
+) {
+    if let Some((from_index, to_index, reason)) = resolver_manager.maybe_select_active(current_time)
+    {
+        *preferred_startup_resolver_index = to_index;
+        record_resolver_switch(
+            resolver_manager.as_mut_slice(),
+            Some(from_index),
+            to_index,
+            reason,
+        );
+        unsafe {
+            let mode = resolver_manager.active().mode;
+            slipstream_set_default_path_mode(resolver_mode_to_c(mode));
+        }
+    }
 }
 
 pub(crate) fn drain_path_events(

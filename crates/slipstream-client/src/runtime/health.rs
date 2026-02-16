@@ -39,6 +39,24 @@ pub(crate) fn should_reconnect_for_resolver_stall(
     None
 }
 
+pub(crate) fn should_reconnect_for_handshake_stall(
+    ready: bool,
+    current_time: u64,
+    connect_started_at: u64,
+    timeout_us: u64,
+) -> Option<u64> {
+    if ready || connect_started_at == 0 {
+        return None;
+    }
+
+    let stall_us = current_time.saturating_sub(connect_started_at);
+    if stall_us >= timeout_us {
+        return Some(stall_us);
+    }
+
+    None
+}
+
 pub(crate) fn should_log_health(
     ready: bool,
     report_time: u64,
@@ -52,7 +70,7 @@ pub(crate) fn should_log_health(
 mod tests {
     use super::{
         compute_last_enqueue_ms, should_log_flow_blocked, should_log_health,
-        should_reconnect_for_resolver_stall,
+        should_reconnect_for_handshake_stall, should_reconnect_for_resolver_stall,
     };
 
     #[test]
@@ -86,6 +104,26 @@ mod tests {
         );
         assert_eq!(
             should_reconnect_for_resolver_stall(true, 1, 5_000, 1_000, 10_000),
+            None
+        );
+    }
+
+    #[test]
+    fn handshake_stall_requires_not_ready_and_timeout() {
+        assert_eq!(
+            should_reconnect_for_handshake_stall(false, 20_000, 1_000, 10_000),
+            Some(19_000)
+        );
+        assert_eq!(
+            should_reconnect_for_handshake_stall(true, 20_000, 1_000, 10_000),
+            None
+        );
+        assert_eq!(
+            should_reconnect_for_handshake_stall(false, 5_000, 1_000, 10_000),
+            None
+        );
+        assert_eq!(
+            should_reconnect_for_handshake_stall(false, 20_000, 0, 10_000),
             None
         );
     }

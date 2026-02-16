@@ -1,3 +1,10 @@
+use super::deadlock::AcceptorSaturationTracker;
+use super::path::maybe_switch_active_resolver;
+use crate::dns::ResolverManager;
+use crate::streams::ClientState;
+use slipstream_ffi::picoquic::picoquic_current_time;
+use tracing::warn;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReconnectReason {
     ActivePathLoss {
@@ -38,6 +45,76 @@ pub(crate) fn decide_acceptor_deadlock_reconnect(
         });
     }
     None
+}
+
+pub(crate) fn reconnect_due_to_active_path_loss(
+    resolver_manager: &mut ResolverManager,
+    current_time: u64,
+    preferred_startup_resolver_index: &mut usize,
+    state_ptr: *mut ClientState,
+    threshold: usize,
+) -> bool {
+    maybe_switch_active_resolver(
+        resolver_manager,
+        current_time,
+        preferred_startup_resolver_index,
+    );
+
+    let streams_len = unsafe { (*state_ptr).streams_len() };
+    let active_path_ready = resolver_manager.active().added;
+    if let Some(reason) =
+        decide_active_path_loss_reconnect(streams_len, active_path_ready, threshold)
+    {
+        log_reconnect_reason(reason);
+        return true;
+    }
+    false
+}
+
+pub(crate) fn reconnect_due_to_acceptor_deadlock(
+    state_ptr: *mut ClientState,
+    acceptor_saturation: &mut AcceptorSaturationTracker,
+) -> bool {
+    let (used, max) = unsafe { (*state_ptr).acceptor_metrics() };
+    let total_bytes = unsafe { (*state_ptr).total_stream_bytes() };
+    let now = unsafe { picoquic_current_time() };
+    let deadlock_detected = acceptor_saturation.update(now, used, max, total_bytes);
+    if let Some(reason) = decide_acceptor_deadlock_reconnect(
+        deadlock_detected,
+        used,
+        max,
+        total_bytes,
+        acceptor_saturation.timeout_us(),
+    ) {
+        log_reconnect_reason(reason);
+        return true;
+    }
+    false
+}
+
+fn log_reconnect_reason(reason: ReconnectReason) {
+    match reason {
+        ReconnectReason::ActivePathLoss { streams_len } => {
+            warn!(
+                "active resolver path deleted with {} streams and no standby path ready; reconnecting to limit reset storm",
+                streams_len,
+            );
+        }
+        ReconnectReason::AcceptorDeadlock {
+            used,
+            max,
+            total_bytes,
+            timeout_us,
+        } => {
+            warn!(
+                "acceptor deadlock for {}s ({}/{}, bytes={}, no progress), forcing reconnect",
+                timeout_us / 1_000_000,
+                used,
+                max,
+                total_bytes
+            );
+        }
+    }
 }
 
 #[cfg(test)]

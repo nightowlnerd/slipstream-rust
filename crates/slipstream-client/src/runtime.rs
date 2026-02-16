@@ -8,24 +8,22 @@ mod setup;
 
 use self::actions::{poll_authoritative_resolver, poll_recursive_resolver, PollDispatch};
 use self::deadlock::AcceptorSaturationTracker;
-use self::decision::{
-    decide_acceptor_deadlock_reconnect, decide_active_path_loss_reconnect, ReconnectReason,
-};
+use self::decision::{reconnect_due_to_acceptor_deadlock, reconnect_due_to_active_path_loss};
 use self::health::{
     compute_last_enqueue_ms, should_log_flow_blocked, should_log_health,
-    should_reconnect_for_resolver_stall,
+    should_reconnect_for_handshake_stall, should_reconnect_for_resolver_stall,
 };
 use self::loop_policy::compute_loop_sleep_policy;
 use self::path::{
-    apply_path_mode, drain_path_events, fetch_path_quality, find_resolver_by_addr_mut,
-    loop_burst_total,
+    apply_path_mode, drain_path_events, fetch_and_record_path_quality, find_resolver_by_addr_mut,
+    loop_burst_total, maybe_switch_active_resolver,
 };
 use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
 use crate::dns::{
     add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
     record_resolver_switch, refresh_resolver_path, resolver_mode_to_c,
     resolver_switch_reason_catalog, sockaddr_storage_to_socket_addr, DnsResponseContext,
-    ResolverManager, ResolverState, ResolverSwitchReason,
+    ResolverManager, ResolverSwitchReason,
 };
 use crate::error::ClientError;
 use crate::pacing::{cwnd_target_polls, inflight_packet_estimate};
@@ -74,6 +72,10 @@ const MIN_POLL_INTERVAL_US: u64 = 100;
 /// connection is active.  This catches cases where the recursive resolver
 /// silently stops forwarding queries (rate-limit, anti-tunnel heuristic, etc.).
 const RESOLVER_STALL_TIMEOUT_US: u64 = 60_000_000;
+/// Force reconnect if the connection never reaches ready state within this
+/// startup window. With multiple recursive resolvers, rotate the startup
+/// resolver index on each stall to avoid sticking on a blocked resolver.
+const HANDSHAKE_STALL_TIMEOUT_US: u64 = 30_000_000;
 /// If a stream is half-closed by the remote side and local upload stays open
 /// without forward progress for too long, abort the local reader to avoid
 /// zombie streams exhausting MAX_STREAMS credit.
@@ -271,110 +273,6 @@ fn drain_commands_by_connection_state(
     }
 }
 
-fn maybe_switch_active_resolver(
-    resolver_manager: &mut ResolverManager,
-    current_time: u64,
-    preferred_startup_resolver_index: &mut usize,
-) {
-    if let Some((from_index, to_index, reason)) = resolver_manager.maybe_select_active(current_time)
-    {
-        *preferred_startup_resolver_index = to_index;
-        record_resolver_switch(
-            resolver_manager.as_mut_slice(),
-            Some(from_index),
-            to_index,
-            reason,
-        );
-        unsafe {
-            let mode = resolver_manager.active().mode;
-            slipstream_set_default_path_mode(resolver_mode_to_c(mode));
-        }
-    }
-}
-
-fn reconnect_due_to_active_path_loss(
-    resolver_manager: &mut ResolverManager,
-    current_time: u64,
-    preferred_startup_resolver_index: &mut usize,
-    state_ptr: *mut ClientState,
-) -> bool {
-    maybe_switch_active_resolver(
-        resolver_manager,
-        current_time,
-        preferred_startup_resolver_index,
-    );
-
-    let streams_len = unsafe { (*state_ptr).streams_len() };
-    let active_path_ready = resolver_manager.active().added;
-    if let Some(reason) = decide_active_path_loss_reconnect(
-        streams_len,
-        active_path_ready,
-        ACTIVE_PATH_LOSS_RECONNECT_STREAMS,
-    ) {
-        log_reconnect_reason(reason);
-        return true;
-    }
-    false
-}
-
-fn reconnect_due_to_acceptor_deadlock(
-    state_ptr: *mut ClientState,
-    acceptor_saturation: &mut AcceptorSaturationTracker,
-) -> bool {
-    let (used, max) = unsafe { (*state_ptr).acceptor_metrics() };
-    let total_bytes = unsafe { (*state_ptr).total_stream_bytes() };
-    let now = unsafe { picoquic_current_time() };
-    let deadlock_detected = acceptor_saturation.update(now, used, max, total_bytes);
-    if let Some(reason) = decide_acceptor_deadlock_reconnect(
-        deadlock_detected,
-        used,
-        max,
-        total_bytes,
-        acceptor_saturation.timeout_us(),
-    ) {
-        log_reconnect_reason(reason);
-        return true;
-    }
-    false
-}
-
-fn log_reconnect_reason(reason: ReconnectReason) {
-    match reason {
-        ReconnectReason::ActivePathLoss { streams_len } => {
-            warn!(
-                "active resolver path deleted with {} streams and no standby path ready; reconnecting to limit reset storm",
-                streams_len,
-            );
-        }
-        ReconnectReason::AcceptorDeadlock {
-            used,
-            max,
-            total_bytes,
-            timeout_us,
-        } => {
-            warn!(
-                "acceptor deadlock for {}s ({}/{}, bytes={}, no progress), forcing reconnect",
-                timeout_us / 1_000_000,
-                used,
-                max,
-                total_bytes
-            );
-        }
-    }
-}
-
-fn fetch_and_record_path_quality(
-    cnx: *mut picoquic_cnx_t,
-    resolver: &mut ResolverState,
-) -> slipstream_ffi::picoquic::picoquic_path_quality_t {
-    let quality = fetch_path_quality(cnx, resolver);
-    resolver.debug.path_rtt_us = quality.rtt;
-    resolver.debug.path_cwnd = quality.cwin;
-    resolver.debug.path_bytes_in_transit = quality.bytes_in_transit;
-    resolver.debug.path_pacing_rate = quality.pacing_rate;
-    quality
-}
-
 pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     let _ = resolver_switch_reason_catalog();
     let mtu = compute_mtu(config.domain)?;
@@ -455,6 +353,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut local_addr_storage = socket_addr_to_storage(udp.local_addr().map_err(map_io)?);
 
         let current_time = unsafe { picoquic_current_time() };
+        let connect_started_at = current_time;
         let quic = unsafe {
             picoquic_create(
                 8,
@@ -595,6 +494,39 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             }
 
             let ready = unsafe { (*state_ptr).is_ready() };
+            if let Some(stall_us) = should_reconnect_for_handshake_stall(
+                ready,
+                current_time,
+                connect_started_at,
+                HANDSHAKE_STALL_TIMEOUT_US,
+            ) {
+                let resolver_count = resolver_manager.as_slice().len();
+                if resolver_count > 1 {
+                    let from_index = resolver_manager.active_index();
+                    let to_index = (from_index + 1) % resolver_count;
+                    let from_addr = resolver_manager.as_slice()[from_index].addr;
+                    let to_addr = resolver_manager.as_slice()[to_index].addr;
+                    record_resolver_switch(
+                        resolver_manager.as_mut_slice(),
+                        Some(from_index),
+                        to_index,
+                        ResolverSwitchReason::TimeoutStreakExceeded,
+                    );
+                    preferred_startup_resolver_index = to_index;
+                    warn!(
+                        "handshake stall for {:.1}s on startup resolver {}; rotating startup resolver to {} and reconnecting",
+                        stall_us as f64 / 1_000_000.0,
+                        from_addr,
+                        to_addr,
+                    );
+                } else {
+                    warn!(
+                        "handshake stall for {:.1}s on single resolver; reconnecting",
+                        stall_us as f64 / 1_000_000.0
+                    );
+                }
+                break;
+            }
             if ready {
                 if last_recv_at == 0 {
                     last_recv_at = current_time;
@@ -620,6 +552,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     current_time,
                     &mut preferred_startup_resolver_index,
                     state_ptr,
+                    ACTIVE_PATH_LOSS_RECONNECT_STREAMS,
                 )
             {
                 break;
@@ -764,6 +697,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     current_time,
                     &mut preferred_startup_resolver_index,
                     state_ptr,
+                    ACTIVE_PATH_LOSS_RECONNECT_STREAMS,
                 )
             {
                 break;

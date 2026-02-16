@@ -83,6 +83,20 @@ pub(crate) enum ResolverSwitchReason {
     CooldownExpired,
 }
 
+pub(crate) fn resolver_switch_reason_catalog() -> &'static [ResolverSwitchReason] {
+    static REASONS: [ResolverSwitchReason; 8] = [
+        ResolverSwitchReason::StartupPrimary,
+        ResolverSwitchReason::ManualOverride,
+        ResolverSwitchReason::ProbeRecovery,
+        ResolverSwitchReason::TimeoutStreakExceeded,
+        ResolverSwitchReason::LossSpike,
+        ResolverSwitchReason::LatencyRegression,
+        ResolverSwitchReason::PathUnavailable,
+        ResolverSwitchReason::CooldownExpired,
+    ];
+    &REASONS
+}
+
 impl ResolverSwitchReason {
     fn as_str(self) -> &'static str {
         match self {

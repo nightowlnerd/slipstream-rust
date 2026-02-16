@@ -534,7 +534,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 if !refresh_resolver_path(cnx, resolver) {
                     continue;
                 }
-                if !resolver.is_active() {
+                if !resolver.is_active() && resolver.mode == ResolverMode::Recursive {
                     continue;
                 }
                 let pending_for_sleep = match resolver.mode {
@@ -859,7 +859,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             }
             watchdog.set_phase(PHASE_POLL_QUERIES);
             for resolver in resolver_manager.as_mut_slice().iter_mut() {
-                if !resolver.is_active() {
+                if !resolver.is_active() && resolver.mode == ResolverMode::Recursive {
                     continue;
                 }
                 if !refresh_resolver_path(cnx, resolver) {

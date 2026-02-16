@@ -489,10 +489,11 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     &mut preferred_startup_resolver_index,
                 );
                 let streams_len = unsafe { (*state_ptr).streams_len() };
-                if streams_len >= ACTIVE_PATH_LOSS_RECONNECT_STREAMS {
+                let active_path_ready = resolver_manager.active().added;
+                if streams_len >= ACTIVE_PATH_LOSS_RECONNECT_STREAMS && !active_path_ready {
                     warn!(
-                        "active resolver path deleted with {} streams; reconnecting to limit reset storm",
-                        streams_len
+                        "active resolver path deleted with {} streams and no standby path ready; reconnecting to limit reset storm",
+                        streams_len,
                     );
                     break;
                 }
@@ -645,10 +646,11 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     &mut preferred_startup_resolver_index,
                 );
                 let streams_len = unsafe { (*state_ptr).streams_len() };
-                if streams_len >= ACTIVE_PATH_LOSS_RECONNECT_STREAMS {
+                let active_path_ready = resolver_manager.active().added;
+                if streams_len >= ACTIVE_PATH_LOSS_RECONNECT_STREAMS && !active_path_ready {
                     warn!(
-                        "active resolver path deleted with {} streams; reconnecting to limit reset storm",
-                        streams_len
+                        "active resolver path deleted with {} streams and no standby path ready; reconnecting to limit reset storm",
+                        streams_len,
                     );
                     break;
                 }

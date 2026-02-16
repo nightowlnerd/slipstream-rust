@@ -71,6 +71,7 @@ const ACCEPTOR_SATURATED_TIMEOUT_US: u64 = 30_000_000;
 /// state at INFO level so we can diagnose silent tunnel deaths.
 const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
 const WATCHDOG_STALE_SECS: u64 = 15;
+const WATCHDOG_SELECT_STALE_SECS: u64 = 45;
 const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 const ACTIVE_PATH_LOSS_RECONNECT_STREAMS: usize = 32;
 
@@ -157,8 +158,13 @@ impl Watchdog {
                         hb.store(now_pico, Ordering::Relaxed);
                         continue;
                     }
-                    if stale_us > WATCHDOG_STALE_SECS * 1_000_000 {
-                        let stuck_phase = ph.load(Ordering::Relaxed);
+                    let stuck_phase = ph.load(Ordering::Relaxed);
+                    let stale_limit_us = if stuck_phase == PHASE_SELECT {
+                        WATCHDOG_SELECT_STALE_SECS * 1_000_000
+                    } else {
+                        WATCHDOG_STALE_SECS * 1_000_000
+                    };
+                    if stale_us > stale_limit_us {
                         eprintln!(
                             "WATCHDOG: main loop stalled for {:.1}s at phase {} ({}), aborting process",
                             stale_us as f64 / 1_000_000.0,

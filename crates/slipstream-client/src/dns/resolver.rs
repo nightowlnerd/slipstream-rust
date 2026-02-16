@@ -1,5 +1,6 @@
 use crate::error::ClientError;
 use crate::pacing::{PacingBudgetSnapshot, PacingPollBudget};
+use slipstream_core::state_machine::ResolverRole;
 use slipstream_core::{normalize_dual_stack_addr, resolve_host_port};
 use slipstream_ffi::{socket_addr_to_storage, ResolverMode, ResolverSpec};
 use std::collections::HashMap;
@@ -13,6 +14,7 @@ pub(crate) struct ResolverState {
     pub(crate) storage: libc::sockaddr_storage,
     pub(crate) local_addr_storage: Option<libc::sockaddr_storage>,
     pub(crate) mode: ResolverMode,
+    pub(crate) role: ResolverRole,
     pub(crate) added: bool,
     pub(crate) path_id: libc::c_int,
     pub(crate) unique_path_id: Option<u64>,
@@ -28,8 +30,8 @@ pub(crate) struct ResolverState {
 impl ResolverState {
     pub(crate) fn label(&self) -> String {
         format!(
-            "path_id={} unique_id={:?} resolver={} mode={:?}",
-            self.path_id, self.unique_path_id, self.addr, self.mode
+            "path_id={} unique_id={:?} resolver={} mode={:?} role={:?}",
+            self.path_id, self.unique_path_id, self.addr, self.mode, self.role
         )
     }
 }
@@ -58,6 +60,11 @@ pub(crate) fn resolve_resolvers(
             storage: socket_addr_to_storage(addr),
             local_addr_storage: None,
             mode: resolver.mode,
+            role: if is_primary {
+                ResolverRole::Active
+            } else {
+                ResolverRole::Standby
+            },
             added: is_primary,
             path_id: if is_primary { 0 } else { -1 },
             unique_path_id: if is_primary { Some(0) } else { None },

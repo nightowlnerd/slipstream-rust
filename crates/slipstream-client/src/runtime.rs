@@ -1,16 +1,35 @@
 mod path;
 mod setup;
 
+<<<<<<< HEAD
 use self::path::{
     apply_path_mode, drain_path_events, fetch_path_quality, find_resolver_by_addr_mut,
     loop_burst_total, path_poll_burst_max,
+=======
+use self::actions::{poll_authoritative_resolver, poll_recursive_resolver, PollDispatch};
+use self::deadlock::AcceptorSaturationTracker;
+use self::decision::{reconnect_due_to_acceptor_deadlock, reconnect_due_to_active_path_loss};
+use self::health::{
+    compute_last_enqueue_ms, should_log_flow_blocked, should_log_health,
+    should_reconnect_for_handshake_stall, should_reconnect_for_resolver_stall,
+};
+use self::loop_policy::compute_loop_sleep_policy;
+use self::path::{
+    apply_path_mode, drain_path_events, fetch_and_record_path_quality, find_resolver_by_addr_mut,
+    loop_burst_total, maybe_switch_active_resolver,
+>>>>>>> e3523a8 (fix(client): rotate startup resolver after handshake stall)
 };
 use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
 use crate::dns::{
     add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
     record_resolver_switch, refresh_resolver_path, resolver_mode_to_c,
+<<<<<<< HEAD
     resolver_switch_reason_catalog, send_poll_queries, sockaddr_storage_to_socket_addr,
     DnsResponseContext, ResolverManager, ResolverSwitchReason,
+=======
+    resolver_switch_reason_catalog, sockaddr_storage_to_socket_addr, DnsResponseContext,
+    ResolverManager, ResolverSwitchReason,
+>>>>>>> e3523a8 (fix(client): rotate startup resolver after handshake stall)
 };
 use crate::error::ClientError;
 use crate::pacing::{cwnd_target_polls, inflight_packet_estimate};
@@ -59,6 +78,10 @@ const MIN_POLL_INTERVAL_US: u64 = 100;
 /// connection is active.  This catches cases where the recursive resolver
 /// silently stops forwarding queries (rate-limit, anti-tunnel heuristic, etc.).
 const RESOLVER_STALL_TIMEOUT_US: u64 = 60_000_000;
+/// Force reconnect if the connection never reaches ready state within this
+/// startup window. With multiple recursive resolvers, rotate the startup
+/// resolver index on each stall to avoid sticking on a blocked resolver.
+const HANDSHAKE_STALL_TIMEOUT_US: u64 = 30_000_000;
 /// If a stream is half-closed by the remote side and local upload stays open
 /// without forward progress for too long, abort the local reader to avoid
 /// zombie streams exhausting MAX_STREAMS credit.
@@ -211,6 +234,7 @@ fn drain_disconnected_commands(command_rx: &mut mpsc::UnboundedReceiver<Command>
     dropped
 }
 
+<<<<<<< HEAD
 fn maybe_switch_active_resolver(
     resolver_manager: &mut ResolverManager,
     current_time: u64,
@@ -229,6 +253,21 @@ fn maybe_switch_active_resolver(
             let mode = resolver_manager.active().mode;
             slipstream_set_default_path_mode(resolver_mode_to_c(mode));
         }
+=======
+fn drain_commands_by_connection_state(
+    cnx: *mut picoquic_cnx_t,
+    state_ptr: *mut ClientState,
+    command_rx: &mut mpsc::UnboundedReceiver<Command>,
+) {
+    // Only process application commands after the QUIC handshake
+    // completes. During reconnect the acceptor may queue NewStream
+    // commands while the connection is still in initial state;
+    // processing them before ready triggers picoquic errors (0xc).
+    if unsafe { (*state_ptr).is_ready() } {
+        drain_commands(cnx, state_ptr, command_rx);
+    } else {
+        let _ = drain_disconnected_commands(command_rx);
+>>>>>>> e3523a8 (fix(client): rotate startup resolver after handshake stall)
     }
 }
 
@@ -313,6 +352,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut local_addr_storage = socket_addr_to_storage(udp.local_addr().map_err(map_io)?);
 
         let current_time = unsafe { picoquic_current_time() };
+        let connect_started_at = current_time;
         let quic = unsafe {
             picoquic_create(
                 8,
@@ -463,6 +503,39 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             }
 
             let ready = unsafe { (*state_ptr).is_ready() };
+            if let Some(stall_us) = should_reconnect_for_handshake_stall(
+                ready,
+                current_time,
+                connect_started_at,
+                HANDSHAKE_STALL_TIMEOUT_US,
+            ) {
+                let resolver_count = resolver_manager.as_slice().len();
+                if resolver_count > 1 {
+                    let from_index = resolver_manager.active_index();
+                    let to_index = (from_index + 1) % resolver_count;
+                    let from_addr = resolver_manager.as_slice()[from_index].addr;
+                    let to_addr = resolver_manager.as_slice()[to_index].addr;
+                    record_resolver_switch(
+                        resolver_manager.as_mut_slice(),
+                        Some(from_index),
+                        to_index,
+                        ResolverSwitchReason::TimeoutStreakExceeded,
+                    );
+                    preferred_startup_resolver_index = to_index;
+                    warn!(
+                        "handshake stall for {:.1}s on startup resolver {}; rotating startup resolver to {} and reconnecting",
+                        stall_us as f64 / 1_000_000.0,
+                        from_addr,
+                        to_addr,
+                    );
+                } else {
+                    warn!(
+                        "handshake stall for {:.1}s on single resolver; reconnecting",
+                        stall_us as f64 / 1_000_000.0
+                    );
+                }
+                break;
+            }
             if ready {
                 if last_recv_at == 0 {
                     last_recv_at = current_time;
@@ -644,6 +717,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     &mut resolver_manager,
                     current_time,
                     &mut preferred_startup_resolver_index,
+<<<<<<< HEAD
                 );
                 let streams_len = unsafe { (*state_ptr).streams_len() };
                 let active_path_ready = resolver_manager.active().added;
@@ -654,6 +728,13 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     );
                     break;
                 }
+=======
+                    state_ptr,
+                    ACTIVE_PATH_LOSS_RECONNECT_STREAMS,
+                )
+            {
+                break;
+>>>>>>> e3523a8 (fix(client): rotate startup resolver after handshake stall)
             }
             let reaped_half_closed = unsafe {
                 let now = picoquic_current_time();

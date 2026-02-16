@@ -32,7 +32,7 @@ use slipstream_ffi::{
         picoquic_set_default_multipath_option, picoquic_state_enum, slipstream_has_ready_stream,
         slipstream_is_flow_blocked, slipstream_mixed_cc_algorithm, slipstream_set_cc_override,
         slipstream_set_cid_limit, slipstream_set_default_path_mode,
-        PICOQUIC_CONNECTION_ID_MAX_SIZE, PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX,
+        PICOQUIC_CONNECTION_ID_MAX_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX,
         PICOQUIC_PACKET_LOOP_SEND_MAX,
     },
     socket_addr_to_storage, take_crypto_errors, ClientConfig, QuicGuard, ResolverMode,
@@ -414,7 +414,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
         let mut dns_id = 1u16;
         let mut recv_buf = vec![0u8; 4096];
-        let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
+        let mut send_buf = vec![0u8; mtu as usize];
         let packet_loop_send_max =
             loop_burst_total(resolver_manager.as_slice(), PICOQUIC_PACKET_LOOP_SEND_MAX);
         let packet_loop_recv_max =

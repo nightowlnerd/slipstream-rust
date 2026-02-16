@@ -86,9 +86,12 @@ pub(crate) fn add_paths(
         if ret == 0 && path_id >= 0 {
             resolver.added = true;
             resolver.path_id = path_id;
+            resolver.debug.path_probe_successes =
+                resolver.debug.path_probe_successes.saturating_add(1);
             info!("Added path {}", resolver.addr);
             continue;
         }
+        resolver.debug.path_probe_failures = resolver.debug.path_probe_failures.saturating_add(1);
         resolver.probe_attempts = resolver.probe_attempts.saturating_add(1);
         let delay = path_probe_backoff(resolver.probe_attempts);
         resolver.next_probe_at = now.saturating_add(delay);

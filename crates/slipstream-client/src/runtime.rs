@@ -8,8 +8,8 @@ use self::path::{
 use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
 use crate::dns::{
     add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
-    refresh_resolver_path, resolve_resolvers, resolver_mode_to_c, send_poll_queries,
-    sockaddr_storage_to_socket_addr, DnsResponseContext,
+    record_resolver_switch, refresh_resolver_path, resolve_resolvers, resolver_mode_to_c,
+    send_poll_queries, sockaddr_storage_to_socket_addr, DnsResponseContext, ResolverSwitchReason,
 };
 use crate::error::ClientError;
 use crate::pacing::{cwnd_target_polls, inflight_packet_estimate};
@@ -278,6 +278,12 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         if resolvers.is_empty() {
             return Err(ClientError::new("At least one resolver is required"));
         }
+        record_resolver_switch(
+            &mut resolvers,
+            None,
+            0,
+            ResolverSwitchReason::StartupPrimary,
+        );
 
         let mut local_addr_storage = socket_addr_to_storage(udp.local_addr().map_err(map_io)?);
 
@@ -449,7 +455,14 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
             for resolver in resolvers.iter_mut() {
                 if resolver.mode == ResolverMode::Authoritative {
-                    expire_inflight_polls(&mut resolver.inflight_poll_ids, current_time);
+                    let expired =
+                        expire_inflight_polls(&mut resolver.inflight_poll_ids, current_time);
+                    if expired > 0 {
+                        resolver.debug.inflight_poll_timeouts = resolver
+                            .debug
+                            .inflight_poll_timeouts
+                            .saturating_add(expired as u64);
+                    }
                 }
             }
 
@@ -466,6 +479,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 let pending_for_sleep = match resolver.mode {
                     ResolverMode::Authoritative => {
                         let quality = fetch_path_quality(cnx, resolver);
+                        resolver.debug.path_rtt_us = quality.rtt;
+                        resolver.debug.path_cwnd = quality.cwin;
+                        resolver.debug.path_bytes_in_transit = quality.bytes_in_transit;
+                        resolver.debug.path_pacing_rate = quality.pacing_rate;
                         let snapshot = resolver
                             .pacing_budget
                             .as_mut()
@@ -759,6 +776,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 match resolver.mode {
                     ResolverMode::Authoritative => {
                         let quality = fetch_path_quality(cnx, resolver);
+                        resolver.debug.path_rtt_us = quality.rtt;
+                        resolver.debug.path_cwnd = quality.cwin;
+                        resolver.debug.path_bytes_in_transit = quality.bytes_in_transit;
+                        resolver.debug.path_pacing_rate = quality.pacing_rate;
                         let snapshot = resolver.last_pacing_snapshot;
                         let pacing_target = snapshot
                             .map(|snapshot| snapshot.target_inflight)
@@ -879,6 +900,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 let pending_for_debug = match resolver.mode {
                     ResolverMode::Authoritative => {
                         let quality = fetch_path_quality(cnx, resolver);
+                        resolver.debug.path_rtt_us = quality.rtt;
+                        resolver.debug.path_cwnd = quality.cwin;
+                        resolver.debug.path_bytes_in_transit = quality.bytes_in_transit;
+                        resolver.debug.path_pacing_rate = quality.pacing_rate;
                         let inflight_packets =
                             inflight_packet_estimate(quality.bytes_in_transit, mtu);
                         resolver

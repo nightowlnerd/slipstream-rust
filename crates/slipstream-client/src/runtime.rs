@@ -1,6 +1,19 @@
+mod deadlock;
+mod decision;
+mod health;
+mod loop_policy;
 mod path;
 mod setup;
 
+use self::deadlock::AcceptorSaturationTracker;
+use self::decision::{
+    decide_acceptor_deadlock_reconnect, decide_active_path_loss_reconnect, ReconnectReason,
+};
+use self::health::{
+    compute_last_enqueue_ms, should_log_flow_blocked, should_log_health,
+    should_reconnect_for_resolver_stall,
+};
+use self::loop_policy::compute_loop_sleep_policy;
 use self::path::{
     apply_path_mode, drain_path_events, fetch_path_quality, find_resolver_by_addr_mut,
     loop_burst_total, path_poll_burst_max,
@@ -10,7 +23,7 @@ use crate::dns::{
     add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
     record_resolver_switch, refresh_resolver_path, resolver_mode_to_c,
     resolver_switch_reason_catalog, send_poll_queries, sockaddr_storage_to_socket_addr,
-    DnsResponseContext, ResolverManager, ResolverSwitchReason,
+    DnsResponseContext, ResolverManager, ResolverState, ResolverSwitchReason,
 };
 use crate::error::ClientError;
 use crate::pacing::{cwnd_target_polls, inflight_packet_estimate};
@@ -240,6 +253,22 @@ fn drain_disconnected_commands(command_rx: &mut mpsc::UnboundedReceiver<Command>
     dropped
 }
 
+fn drain_commands_by_connection_state(
+    cnx: *mut picoquic_cnx_t,
+    state_ptr: *mut ClientState,
+    command_rx: &mut mpsc::UnboundedReceiver<Command>,
+) {
+    // Only process application commands after the QUIC handshake
+    // completes. During reconnect the acceptor may queue NewStream
+    // commands while the connection is still in initial state;
+    // processing them before ready triggers picoquic errors (0xc).
+    if unsafe { (*state_ptr).is_ready() } {
+        drain_commands(cnx, state_ptr, command_rx);
+    } else {
+        let _ = drain_disconnected_commands(command_rx);
+    }
+}
+
 fn maybe_switch_active_resolver(
     resolver_manager: &mut ResolverManager,
     current_time: u64,
@@ -259,6 +288,89 @@ fn maybe_switch_active_resolver(
             slipstream_set_default_path_mode(resolver_mode_to_c(mode));
         }
     }
+}
+
+fn reconnect_due_to_active_path_loss(
+    resolver_manager: &mut ResolverManager,
+    current_time: u64,
+    preferred_startup_resolver_index: &mut usize,
+    state_ptr: *mut ClientState,
+) -> bool {
+    maybe_switch_active_resolver(
+        resolver_manager,
+        current_time,
+        preferred_startup_resolver_index,
+    );
+
+    let streams_len = unsafe { (*state_ptr).streams_len() };
+    let active_path_ready = resolver_manager.active().added;
+    if let Some(reason) = decide_active_path_loss_reconnect(
+        streams_len,
+        active_path_ready,
+        ACTIVE_PATH_LOSS_RECONNECT_STREAMS,
+    ) {
+        log_reconnect_reason(reason);
+        return true;
+    }
+    false
+}
+
+fn reconnect_due_to_acceptor_deadlock(
+    state_ptr: *mut ClientState,
+    acceptor_saturation: &mut AcceptorSaturationTracker,
+) -> bool {
+    let (used, max) = unsafe { (*state_ptr).acceptor_metrics() };
+    let total_bytes = unsafe { (*state_ptr).total_stream_bytes() };
+    let now = unsafe { picoquic_current_time() };
+    let deadlock_detected = acceptor_saturation.update(now, used, max, total_bytes);
+    if let Some(reason) = decide_acceptor_deadlock_reconnect(
+        deadlock_detected,
+        used,
+        max,
+        total_bytes,
+        acceptor_saturation.timeout_us(),
+    ) {
+        log_reconnect_reason(reason);
+        return true;
+    }
+    false
+}
+
+fn log_reconnect_reason(reason: ReconnectReason) {
+    match reason {
+        ReconnectReason::ActivePathLoss { streams_len } => {
+            warn!(
+                "active resolver path deleted with {} streams and no standby path ready; reconnecting to limit reset storm",
+                streams_len,
+            );
+        }
+        ReconnectReason::AcceptorDeadlock {
+            used,
+            max,
+            total_bytes,
+            timeout_us,
+        } => {
+            warn!(
+                "acceptor deadlock for {}s ({}/{}, bytes={}, no progress), forcing reconnect",
+                timeout_us / 1_000_000,
+                used,
+                max,
+                total_bytes
+            );
+        }
+    }
+}
+
+fn fetch_and_record_path_quality(
+    cnx: *mut picoquic_cnx_t,
+    resolver: &mut ResolverState,
+) -> slipstream_ffi::picoquic::picoquic_path_quality_t {
+    let quality = fetch_path_quality(cnx, resolver);
+    resolver.debug.path_rtt_us = quality.rtt;
+    resolver.debug.path_cwnd = quality.cwin;
+    resolver.debug.path_bytes_in_transit = quality.bytes_in_transit;
+    resolver.debug.path_pacing_rate = quality.pacing_rate;
+    quality
 }
 
 pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
@@ -448,9 +560,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut last_flow_block_log_at = 0u64;
         let mut last_recv_at = 0u64;
         let mut last_health_log_at = 0u64;
-        let mut acceptor_saturated_since: u64 = 0;
-        let mut acceptor_saturated_max: usize = 0;
-        let mut acceptor_saturated_bytes: u64 = 0;
+        let mut acceptor_saturation = AcceptorSaturationTracker::new(ACCEPTOR_SATURATED_TIMEOUT_US);
         let watchdog = Watchdog::spawn();
 
         // Clear closing flag that picoquic_free (QuicGuard::drop) may have
@@ -463,15 +573,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             watchdog.pet();
             watchdog.set_phase(PHASE_DRAIN_COMMANDS);
             let current_time = unsafe { picoquic_current_time() };
-            // Only process application commands after the QUIC handshake
-            // completes.  During reconnect the acceptor may queue NewStream
-            // commands while the connection is still in initial state;
-            // processing them before ready triggers picoquic errors (0xc).
-            if unsafe { (*state_ptr).is_ready() } {
-                drain_commands(cnx, state_ptr, &mut command_rx);
-            } else {
-                let _ = drain_disconnected_commands(&mut command_rx);
-            }
+            drain_commands_by_connection_state(cnx, state_ptr, &mut command_rx);
             watchdog.set_phase(PHASE_DRAIN_STREAM_DATA);
             drain_stream_data(cnx, state_ptr);
             watchdog.set_phase(PHASE_CNX_STATE_CHECK);
@@ -510,21 +612,15 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             }
             let active_path_deleted =
                 drain_path_events(cnx, resolver_manager.as_mut_slice(), state_ptr);
-            if active_path_deleted {
-                maybe_switch_active_resolver(
+            if active_path_deleted
+                && reconnect_due_to_active_path_loss(
                     &mut resolver_manager,
                     current_time,
                     &mut preferred_startup_resolver_index,
-                );
-                let streams_len = unsafe { (*state_ptr).streams_len() };
-                let active_path_ready = resolver_manager.active().added;
-                if streams_len >= ACTIVE_PATH_LOSS_RECONNECT_STREAMS && !active_path_ready {
-                    warn!(
-                        "active resolver path deleted with {} streams and no standby path ready; reconnecting to limit reset storm",
-                        streams_len,
-                    );
-                    break;
-                }
+                    state_ptr,
+                )
+            {
+                break;
             }
 
             for resolver in resolver_manager.as_mut_slice().iter_mut() {
@@ -555,11 +651,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
                 let pending_for_sleep = match resolver.mode {
                     ResolverMode::Authoritative => {
-                        let quality = fetch_path_quality(cnx, resolver);
-                        resolver.debug.path_rtt_us = quality.rtt;
-                        resolver.debug.path_cwnd = quality.cwin;
-                        resolver.debug.path_bytes_in_transit = quality.bytes_in_transit;
-                        resolver.debug.path_pacing_rate = quality.pacing_rate;
+                        let quality = fetch_and_record_path_quality(cnx, resolver);
                         let snapshot = resolver
                             .pacing_budget
                             .as_mut()
@@ -584,12 +676,13 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
             }
             // Avoid a tight poll loop when idle, but keep the short slice during active transfers.
-            let timeout_us = if has_work {
-                delay_us.clamp(MIN_POLL_INTERVAL_US, DNS_POLL_SLICE_US)
-            } else {
-                delay_us.max(MIN_POLL_INTERVAL_US)
-            };
-            let timeout = Duration::from_micros(timeout_us);
+            let sleep_policy = compute_loop_sleep_policy(
+                delay_us,
+                has_work,
+                MIN_POLL_INTERVAL_US,
+                DNS_POLL_SLICE_US,
+            );
+            let timeout = sleep_policy.timeout;
 
             watchdog.set_phase(PHASE_SELECT);
             let pre_select = Instant::now();
@@ -653,35 +746,25 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     "select overslept: {:.1}s (timeout was {:.1}s, has_work={})",
                     select_elapsed.as_secs_f64(),
                     timeout.as_secs_f64(),
-                    has_work,
+                    sleep_policy.has_work,
                 );
             }
             watchdog.pet();
 
             watchdog.set_phase(PHASE_POST_DRAIN);
-            if unsafe { (*state_ptr).is_ready() } {
-                drain_commands(cnx, state_ptr, &mut command_rx);
-            } else {
-                let _ = drain_disconnected_commands(&mut command_rx);
-            }
+            drain_commands_by_connection_state(cnx, state_ptr, &mut command_rx);
             drain_stream_data(cnx, state_ptr);
             let active_path_deleted =
                 drain_path_events(cnx, resolver_manager.as_mut_slice(), state_ptr);
-            if active_path_deleted {
-                maybe_switch_active_resolver(
+            if active_path_deleted
+                && reconnect_due_to_active_path_loss(
                     &mut resolver_manager,
                     current_time,
                     &mut preferred_startup_resolver_index,
-                );
-                let streams_len = unsafe { (*state_ptr).streams_len() };
-                let active_path_ready = resolver_manager.active().added;
-                if streams_len >= ACTIVE_PATH_LOSS_RECONNECT_STREAMS && !active_path_ready {
-                    warn!(
-                        "active resolver path deleted with {} streams and no standby path ready; reconnecting to limit reset storm",
-                        streams_len,
-                    );
-                    break;
-                }
+                    state_ptr,
+                )
+            {
+                break;
             }
             let reaped_half_closed = unsafe {
                 let now = picoquic_current_time();
@@ -697,42 +780,8 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
             // Circuit breaker: force reconnect when MAX_STREAMS is fully
             // consumed and no progress is being made (flow control deadlock).
-            //
-            // Three gates prevent false-triggering on healthy saturated connections:
-            //   1. `used >= max` — acceptor budget fully consumed
-            //   2. `max` unchanged — peer hasn't extended MAX_STREAMS
-            //   3. total stream bytes unchanged — no data flowing (true deadlock)
-            //
-            // Any gate resetting (MAX_STREAMS extended, or bytes increasing)
-            // restarts the 30s timer.
-            {
-                let (used, max) = unsafe { (*state_ptr).acceptor_metrics() };
-                let total_bytes = unsafe { (*state_ptr).total_stream_bytes() };
-                if max > 0 && used >= max {
-                    let now = unsafe { picoquic_current_time() };
-                    if acceptor_saturated_since == 0
-                        || max != acceptor_saturated_max
-                        || total_bytes != acceptor_saturated_bytes
-                    {
-                        // First saturation, limit extended, or bytes moved — (re)start.
-                        acceptor_saturated_since = now;
-                        acceptor_saturated_max = max;
-                        acceptor_saturated_bytes = total_bytes;
-                    } else if now.saturating_sub(acceptor_saturated_since)
-                        >= ACCEPTOR_SATURATED_TIMEOUT_US
-                    {
-                        warn!(
-                            "acceptor deadlock for {}s ({}/{}, bytes={}, no progress), forcing reconnect",
-                            ACCEPTOR_SATURATED_TIMEOUT_US / 1_000_000,
-                            used,
-                            max,
-                            total_bytes
-                        );
-                        break;
-                    }
-                } else {
-                    acceptor_saturated_since = 0;
-                }
+            if reconnect_due_to_acceptor_deadlock(state_ptr, &mut acceptor_saturation) {
+                break;
             }
 
             let mut sent_quic_data = false;
@@ -840,38 +889,38 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             let has_ready_stream = unsafe { slipstream_has_ready_stream(cnx) != 0 };
             let flow_blocked = unsafe { slipstream_is_flow_blocked(cnx) != 0 };
             let streams_len = unsafe { (*state_ptr).streams_len() };
-            if streams_len > 0 && has_ready_stream && flow_blocked {
-                let now = unsafe { picoquic_current_time() };
-                if now.saturating_sub(last_flow_block_log_at) >= FLOW_BLOCKED_LOG_INTERVAL_US {
-                    let metrics = unsafe { (*state_ptr).stream_debug_metrics() };
-                    let backlog = unsafe { (*state_ptr).stream_backlog_summaries(8) };
-                    let (enqueued_bytes, last_enqueue_at) =
-                        unsafe { (*state_ptr).debug_snapshot() };
-                    let last_enqueue_ms = if last_enqueue_at == 0 {
-                        0
-                    } else {
-                        now.saturating_sub(last_enqueue_at) / 1_000
-                    };
-                    error!(
-                        "connection flow blocked: streams={} streams_with_rx_queued={} queued_bytes_total={} streams_with_recv_fin={} streams_with_send_fin={} streams_discarding={} streams_with_unconsumed_rx={} enqueued_bytes={} last_enqueue_ms={} zero_send_with_streams={} zero_send_loops={} data_ready_skips={} flow_blocked={} has_ready_stream={} backlog={:?}",
-                        streams_len,
-                        metrics.streams_with_rx_queued,
-                        metrics.queued_bytes_total,
-                        metrics.streams_with_recv_fin,
-                        metrics.streams_with_send_fin,
-                        metrics.streams_discarding,
-                        metrics.streams_with_unconsumed_rx,
-                        enqueued_bytes,
-                        last_enqueue_ms,
-                        zero_send_with_streams,
-                        zero_send_loops,
-                        data_ready_skips,
-                        flow_blocked,
-                        has_ready_stream,
-                        backlog
-                    );
-                    last_flow_block_log_at = now;
-                }
+            let now = unsafe { picoquic_current_time() };
+            if should_log_flow_blocked(
+                streams_len,
+                has_ready_stream,
+                flow_blocked,
+                now,
+                last_flow_block_log_at,
+                FLOW_BLOCKED_LOG_INTERVAL_US,
+            ) {
+                let metrics = unsafe { (*state_ptr).stream_debug_metrics() };
+                let backlog = unsafe { (*state_ptr).stream_backlog_summaries(8) };
+                let (enqueued_bytes, last_enqueue_at) = unsafe { (*state_ptr).debug_snapshot() };
+                let last_enqueue_ms = compute_last_enqueue_ms(now, last_enqueue_at);
+                error!(
+                    "connection flow blocked: streams={} streams_with_rx_queued={} queued_bytes_total={} streams_with_recv_fin={} streams_with_send_fin={} streams_discarding={} streams_with_unconsumed_rx={} enqueued_bytes={} last_enqueue_ms={} zero_send_with_streams={} zero_send_loops={} data_ready_skips={} flow_blocked={} has_ready_stream={} backlog={:?}",
+                    streams_len,
+                    metrics.streams_with_rx_queued,
+                    metrics.queued_bytes_total,
+                    metrics.streams_with_recv_fin,
+                    metrics.streams_with_send_fin,
+                    metrics.streams_discarding,
+                    metrics.streams_with_unconsumed_rx,
+                    enqueued_bytes,
+                    last_enqueue_ms,
+                    zero_send_with_streams,
+                    zero_send_loops,
+                    data_ready_skips,
+                    flow_blocked,
+                    has_ready_stream,
+                    backlog
+                );
+                last_flow_block_log_at = now;
             }
             watchdog.set_phase(PHASE_POLL_QUERIES);
             for resolver in resolver_manager.as_mut_slice().iter_mut() {
@@ -883,11 +932,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 }
                 match resolver.mode {
                     ResolverMode::Authoritative => {
-                        let quality = fetch_path_quality(cnx, resolver);
-                        resolver.debug.path_rtt_us = quality.rtt;
-                        resolver.debug.path_cwnd = quality.cwin;
-                        resolver.debug.path_bytes_in_transit = quality.bytes_in_transit;
-                        resolver.debug.path_pacing_rate = quality.pacing_rate;
+                        let quality = fetch_and_record_path_quality(cnx, resolver);
                         let snapshot = resolver.last_pacing_snapshot;
                         let pacing_target = snapshot
                             .map(|snapshot| snapshot.target_inflight)
@@ -977,18 +1022,21 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             // new QUIC handshake resets resolver state.
             // Only check when streams are active — idle connections legitimately
             // receive no responses and should not trigger a reconnect.
-            if last_recv_at > 0 && ready {
-                let streams_len = unsafe { (*state_ptr).streams_len() };
-                let stall_us = current_time.saturating_sub(last_recv_at);
-                if streams_len > 0 && stall_us >= RESOLVER_STALL_TIMEOUT_US {
-                    warn!(
-                        "resolver stall detected: no DNS responses for {:.1}s, streams={}, forcing reconnect",
-                        stall_us as f64 / 1_000_000.0,
-                        streams_len,
-                    );
-                    // Don't close here — the post-loop picoquic_close handles it.
-                    break;
-                }
+            let streams_len = unsafe { (*state_ptr).streams_len() };
+            if let Some(stall_us) = should_reconnect_for_resolver_stall(
+                ready,
+                streams_len,
+                current_time,
+                last_recv_at,
+                RESOLVER_STALL_TIMEOUT_US,
+            ) {
+                warn!(
+                    "resolver stall detected: no DNS responses for {:.1}s, streams={}, forcing reconnect",
+                    stall_us as f64 / 1_000_000.0,
+                    streams_len,
+                );
+                // Don't close here — the post-loop picoquic_close handles it.
+                break;
             }
 
             watchdog.set_phase(PHASE_HEALTH_LOG);
@@ -1007,11 +1055,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 let inflight_polls = resolver.inflight_poll_ids.len();
                 let pending_for_debug = match resolver.mode {
                     ResolverMode::Authoritative => {
-                        let quality = fetch_path_quality(cnx, resolver);
-                        resolver.debug.path_rtt_us = quality.rtt;
-                        resolver.debug.path_cwnd = quality.cwin;
-                        resolver.debug.path_bytes_in_transit = quality.bytes_in_transit;
-                        resolver.debug.path_pacing_rate = quality.pacing_rate;
+                        let quality = fetch_and_record_path_quality(cnx, resolver);
                         let inflight_packets =
                             inflight_packet_estimate(quality.bytes_in_transit, mtu);
                         resolver
@@ -1035,7 +1079,12 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
             // Periodic health heartbeat: log key metrics at INFO level so we
             // can diagnose silent tunnel deaths from production logs.
-            if ready && report_time.saturating_sub(last_health_log_at) >= HEALTH_LOG_INTERVAL_US {
+            if should_log_health(
+                ready,
+                report_time,
+                last_health_log_at,
+                HEALTH_LOG_INTERVAL_US,
+            ) {
                 last_health_log_at = report_time;
                 let (acceptor_used, acceptor_max) = unsafe { (*state_ptr).acceptor_metrics() };
                 let recv_age_s = if last_recv_at > 0 {

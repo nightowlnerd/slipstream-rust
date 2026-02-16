@@ -234,8 +234,7 @@ fn maybe_switch_active_resolver(
 
 pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     let _ = resolver_switch_reason_catalog();
-    let domain_len = config.domain.len();
-    let mtu = compute_mtu(domain_len)?;
+    let mtu = compute_mtu(config.domain)?;
     let udp = bind_udp_socket().await?;
 
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();

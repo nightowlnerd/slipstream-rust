@@ -163,34 +163,6 @@ fn update_active_delete_suspect(now: u64, first_at: u64, count: u8) -> (u64, u8,
     (first_at, count, count >= ACTIVE_PATH_DELETE_CONFIRM_EVENTS)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::update_active_delete_suspect;
-
-    #[test]
-    fn first_delete_starts_suspect_window() {
-        let (first_at, count, confirmed) = update_active_delete_suspect(1_000, 0, 0);
-        assert_eq!(first_at, 1_000);
-        assert_eq!(count, 1);
-        assert!(!confirmed);
-    }
-
-    #[test]
-    fn second_delete_inside_window_confirms_unavailable() {
-        let (_, count, confirmed) = update_active_delete_suspect(2_000, 1_000, 1);
-        assert_eq!(count, 2);
-        assert!(confirmed);
-    }
-
-    #[test]
-    fn delete_outside_window_resets_suspect_counter() {
-        let (first_at, count, confirmed) = update_active_delete_suspect(5_000_000, 1_000, 1);
-        assert_eq!(first_at, 5_000_000);
-        assert_eq!(count, 1);
-        assert!(!confirmed);
-    }
-}
-
 fn path_peer_addr(cnx: *mut picoquic_cnx_t, unique_path_id: u64) -> Option<SocketAddr> {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let ret = unsafe { picoquic_get_path_addr(cnx, unique_path_id, 2, &mut storage) };
@@ -232,4 +204,32 @@ fn find_resolver_by_unique_id_mut(
     resolvers
         .iter_mut()
         .find(|resolver| resolver.unique_path_id == Some(unique_path_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_active_delete_suspect;
+
+    #[test]
+    fn first_delete_starts_suspect_window() {
+        let (first_at, count, confirmed) = update_active_delete_suspect(1_000, 0, 0);
+        assert_eq!(first_at, 1_000);
+        assert_eq!(count, 1);
+        assert!(!confirmed);
+    }
+
+    #[test]
+    fn second_delete_inside_window_confirms_unavailable() {
+        let (_, count, confirmed) = update_active_delete_suspect(2_000, 1_000, 1);
+        assert_eq!(count, 2);
+        assert!(confirmed);
+    }
+
+    #[test]
+    fn delete_outside_window_resets_suspect_counter() {
+        let (first_at, count, confirmed) = update_active_delete_suspect(5_000_000, 1_000, 1);
+        assert_eq!(first_at, 5_000_000);
+        assert_eq!(count, 1);
+        assert!(!confirmed);
+    }
 }

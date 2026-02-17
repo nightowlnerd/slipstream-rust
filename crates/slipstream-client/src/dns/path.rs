@@ -15,6 +15,7 @@ use super::resolver::{
 const PATH_PROBE_INITIAL_DELAY_US: u64 = 250_000;
 const PATH_PROBE_MAX_DELAY_US: u64 = 10_000_000;
 const PROBE_FAILURE_LOG_INTERVAL_US: u64 = 10_000_000;
+const SKIP_STANDBY_RECURSIVE_PATH_PROBES: bool = true;
 
 pub(crate) fn refresh_resolver_path(
     cnx: *mut picoquic_cnx_t,
@@ -75,6 +76,9 @@ pub(crate) fn add_paths(
     let mut default_mode = primary_mode;
 
     for resolver in resolvers.iter_mut().skip(1) {
+        if SKIP_STANDBY_RECURSIVE_PATH_PROBES && resolver.mode == ResolverMode::Recursive {
+            continue;
+        }
         if resolver.added {
             continue;
         }

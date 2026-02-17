@@ -861,6 +861,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 last_flow_block_log_at = now;
             }
             watchdog.set_phase(PHASE_POLL_QUERIES);
+            let multi_resolver_mode = resolver_manager.as_slice().len() > 1;
             for resolver in resolver_manager.as_mut_slice().iter_mut() {
                 if !resolver.is_active() && resolver.mode == ResolverMode::Recursive {
                     continue;
@@ -900,9 +901,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                             cnx,
                             &mut dispatch,
                             resolver,
+                            multi_resolver_mode,
                             has_ready_stream,
                             flow_blocked,
-                            sent_quic_data,
                         )
                         .await?;
                     }

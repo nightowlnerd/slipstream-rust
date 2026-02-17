@@ -8,10 +8,10 @@ use tracing::debug;
 
 use super::path::{fetch_path_quality, path_poll_burst_max};
 
-const RECURSIVE_POLL_MIN_INTERVAL_US_ACTIVE: u64 = 5_000;
-const RECURSIVE_POLL_MIN_INTERVAL_US_IDLE: u64 = 1_000;
-const RECURSIVE_POLL_BURST_ACTIVE_STREAMS: usize = 1;
-const RECURSIVE_POLL_BURST_IDLE: usize = 4;
+const RECURSIVE_POLL_MIN_INTERVAL_US_ACTIVE: u64 = 1_000;
+const RECURSIVE_POLL_MIN_INTERVAL_US_IDLE: u64 = 500;
+const RECURSIVE_POLL_BURST_ACTIVE_STREAMS: usize = 2;
+const RECURSIVE_POLL_BURST_IDLE: usize = 8;
 
 pub(crate) struct PollDispatch<'a, 'cfg> {
     pub(crate) udp: &'a TokioUdpSocket,
@@ -82,9 +82,9 @@ pub(crate) async fn poll_recursive_resolver(
     cnx: *mut picoquic_cnx_t,
     dispatch: &mut PollDispatch<'_, '_>,
     resolver: &mut ResolverState,
+    multi_resolver_mode: bool,
     has_ready_stream: bool,
     flow_blocked: bool,
-    sent_quic_data: bool,
 ) -> Result<(), ClientError> {
     if resolver.mode != ResolverMode::Recursive {
         return Ok(());
@@ -96,26 +96,28 @@ pub(crate) async fn poll_recursive_resolver(
     }
 
     let now = unsafe { slipstream_ffi::picoquic::picoquic_current_time() };
-    let min_interval = if has_ready_stream {
-        RECURSIVE_POLL_MIN_INTERVAL_US_ACTIVE
-    } else {
-        RECURSIVE_POLL_MIN_INTERVAL_US_IDLE
-    };
-    if resolver.last_recursive_poll_sent_at > 0
-        && now.saturating_sub(resolver.last_recursive_poll_sent_at) < min_interval
-    {
-        return Ok(());
-    }
-
-    if has_ready_stream && !flow_blocked && sent_quic_data {
-        return Ok(());
+    if multi_resolver_mode {
+        let min_interval = if has_ready_stream {
+            RECURSIVE_POLL_MIN_INTERVAL_US_ACTIVE
+        } else {
+            RECURSIVE_POLL_MIN_INTERVAL_US_IDLE
+        };
+        if resolver.last_recursive_poll_sent_at > 0
+            && now.saturating_sub(resolver.last_recursive_poll_sent_at) < min_interval
+        {
+            return Ok(());
+        }
     }
 
     let burst_max = path_poll_burst_max(resolver);
-    let burst_cap = if has_ready_stream {
-        RECURSIVE_POLL_BURST_ACTIVE_STREAMS
+    let burst_cap = if multi_resolver_mode {
+        if has_ready_stream && !flow_blocked {
+            RECURSIVE_POLL_BURST_ACTIVE_STREAMS
+        } else {
+            RECURSIVE_POLL_BURST_IDLE
+        }
     } else {
-        RECURSIVE_POLL_BURST_IDLE
+        burst_max
     };
     let burst_max = burst_max.min(burst_cap.max(1));
     let polls_sent_before = resolver.debug.polls_sent;

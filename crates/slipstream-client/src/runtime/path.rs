@@ -1,5 +1,6 @@
 use crate::dns::{
-    record_resolver_switch, refresh_resolver_path, reset_resolver_path, resolver_mode_to_c,
+    note_active_path_delete_signal, record_resolver_switch, refresh_resolver_path,
+    reset_resolver_path, resolver_mode_to_c, should_failover_active_path,
     sockaddr_storage_to_socket_addr, ResolverManager, ResolverState,
 };
 use crate::error::ClientError;
@@ -16,8 +17,6 @@ use std::net::SocketAddr;
 use tracing::warn;
 
 const AUTHORITATIVE_LOOP_MULTIPLIER: usize = 4;
-const ACTIVE_PATH_DELETE_CONFIRM_EVENTS: u8 = 2;
-const ACTIVE_PATH_DELETE_CONFIRM_WINDOW_US: u64 = 3_000_000;
 
 pub(crate) fn apply_path_mode(
     cnx: *mut picoquic_cnx_t,
@@ -117,10 +116,16 @@ pub(crate) fn drain_path_events(
             PathEvent::Deleted(unique_path_id) => {
                 if let Some(resolver) = find_resolver_by_unique_id_mut(resolvers, unique_path_id) {
                     if resolver.is_active() {
-                        if should_confirm_active_path_delete(resolver) {
+                        let now = unsafe { slipstream_ffi::picoquic::picoquic_current_time() };
+                        note_active_path_delete_signal(resolver, now);
+                        if should_failover_active_path(resolver, now) {
                             active_path_deleted = true;
                             reset_resolver_path(resolver);
                         } else {
+                            warn!(
+                                "active path delete observed for resolver {}; waiting for progress-confirmed failover",
+                                resolver.addr
+                            );
                             resolver.unique_path_id = None;
                         }
                         continue;
@@ -132,35 +137,6 @@ pub(crate) fn drain_path_events(
     }
 
     active_path_deleted
-}
-
-fn should_confirm_active_path_delete(resolver: &mut ResolverState) -> bool {
-    let now = unsafe { slipstream_ffi::picoquic::picoquic_current_time() };
-    let (first_at, suspect_count, confirmed) = update_active_delete_suspect(
-        now,
-        resolver.active_delete_first_at,
-        resolver.active_delete_suspect_count,
-    );
-    resolver.active_delete_first_at = first_at;
-    resolver.active_delete_suspect_count = suspect_count;
-    if !confirmed {
-        warn!(
-            "active path delete observed for resolver {}; waiting for confirmation",
-            resolver.addr
-        );
-        return false;
-    }
-
-    true
-}
-
-fn update_active_delete_suspect(now: u64, first_at: u64, count: u8) -> (u64, u8, bool) {
-    if first_at == 0 || now.saturating_sub(first_at) > ACTIVE_PATH_DELETE_CONFIRM_WINDOW_US {
-        return (now, 1, false);
-    }
-
-    let count = count.saturating_add(1);
-    (first_at, count, count >= ACTIVE_PATH_DELETE_CONFIRM_EVENTS)
 }
 
 fn path_peer_addr(cnx: *mut picoquic_cnx_t, unique_path_id: u64) -> Option<SocketAddr> {
@@ -204,32 +180,4 @@ fn find_resolver_by_unique_id_mut(
     resolvers
         .iter_mut()
         .find(|resolver| resolver.unique_path_id == Some(unique_path_id))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::update_active_delete_suspect;
-
-    #[test]
-    fn first_delete_starts_suspect_window() {
-        let (first_at, count, confirmed) = update_active_delete_suspect(1_000, 0, 0);
-        assert_eq!(first_at, 1_000);
-        assert_eq!(count, 1);
-        assert!(!confirmed);
-    }
-
-    #[test]
-    fn second_delete_inside_window_confirms_unavailable() {
-        let (_, count, confirmed) = update_active_delete_suspect(2_000, 1_000, 1);
-        assert_eq!(count, 2);
-        assert!(confirmed);
-    }
-
-    #[test]
-    fn delete_outside_window_resets_suspect_counter() {
-        let (first_at, count, confirmed) = update_active_delete_suspect(5_000_000, 1_000, 1);
-        assert_eq!(first_at, 5_000_000);
-        assert_eq!(count, 1);
-        assert!(!confirmed);
-    }
 }

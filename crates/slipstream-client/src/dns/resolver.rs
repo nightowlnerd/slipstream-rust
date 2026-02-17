@@ -2,6 +2,7 @@ use crate::error::ClientError;
 use crate::pacing::{PacingBudgetSnapshot, PacingPollBudget};
 use slipstream_core::state_machine::ResolverRole;
 use slipstream_core::{normalize_dual_stack_addr, resolve_host_port};
+use slipstream_ffi::picoquic::picoquic_current_time;
 use slipstream_ffi::{socket_addr_to_storage, ResolverMode, ResolverSpec};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -17,6 +18,18 @@ const SCORE_UNAVAILABLE_PENALTY: u64 = 2_000_000;
 const SCORE_TIMEOUT_PENALTY: u64 = 50_000;
 const SCORE_PROBE_FAILURE_PENALTY: u64 = 20_000;
 const SCORE_STICKINESS_BIAS: u64 = 10_000;
+const PATH_UNAVAILABLE_LOG_INTERVAL_US: u64 = 5_000_000;
+const ACTIVE_FAILOVER_MIN_DELETE_EVENTS: u8 = 2;
+const ACTIVE_FAILOVER_MIN_REFRESH_FAILURES: u8 = 2;
+const ACTIVE_FAILOVER_STALE_PROGRESS_US: u64 = 2_000_000;
+const ACTIVE_FAILOVER_SUSPECT_WINDOW_US: u64 = 5_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolverHealthState {
+    Healthy,
+    Suspect,
+    Unavailable,
+}
 
 pub(crate) struct ResolverManager {
     resolvers: Vec<ResolverState>,
@@ -37,13 +50,18 @@ pub(crate) struct ResolverState {
     pub(crate) unique_path_id: Option<u64>,
     pub(crate) probe_attempts: u32,
     pub(crate) next_probe_at: u64,
+    pub(crate) last_probe_failure_log_at: u64,
+    pub(crate) last_path_unavailable_log_at: u64,
     pub(crate) pending_polls: usize,
     pub(crate) inflight_poll_ids: HashMap<u16, u64>,
     pub(crate) pacing_budget: Option<PacingPollBudget>,
     pub(crate) last_pacing_snapshot: Option<PacingBudgetSnapshot>,
     pub(crate) debug: DebugMetrics,
+    pub(crate) health: ResolverHealthState,
     pub(crate) active_delete_suspect_count: u8,
+    pub(crate) active_refresh_suspect_count: u8,
     pub(crate) active_delete_first_at: u64,
+    pub(crate) last_progress_at: u64,
 }
 
 impl ResolverState {
@@ -120,8 +138,11 @@ impl ResolverManager {
             resolver.last_pacing_snapshot = None;
             resolver.probe_attempts = 0;
             resolver.next_probe_at = 0;
+            resolver.health = ResolverHealthState::Healthy;
             resolver.active_delete_suspect_count = 0;
+            resolver.active_refresh_suspect_count = 0;
             resolver.active_delete_first_at = 0;
+            resolver.last_progress_at = 0;
         }
     }
 
@@ -287,6 +308,8 @@ pub(crate) fn resolve_resolvers(
             unique_path_id: None,
             probe_attempts: 0,
             next_probe_at: 0,
+            last_probe_failure_log_at: 0,
+            last_path_unavailable_log_at: 0,
             pending_polls: 0,
             inflight_poll_ids: HashMap::new(),
             pacing_budget: match resolver.mode {
@@ -295,18 +318,28 @@ pub(crate) fn resolve_resolvers(
             },
             last_pacing_snapshot: None,
             debug: DebugMetrics::new(debug_poll),
+            health: ResolverHealthState::Healthy,
             active_delete_suspect_count: 0,
+            active_refresh_suspect_count: 0,
             active_delete_first_at: 0,
+            last_progress_at: 0,
         });
     }
     Ok(resolved)
 }
 
 pub(crate) fn reset_resolver_path(resolver: &mut ResolverState) {
-    warn!(
-        "Path for resolver {} became unavailable; resetting state",
-        resolver.addr
-    );
+    let now = unsafe { picoquic_current_time() };
+    if resolver.last_path_unavailable_log_at == 0
+        || now.saturating_sub(resolver.last_path_unavailable_log_at)
+            >= PATH_UNAVAILABLE_LOG_INTERVAL_US
+    {
+        resolver.last_path_unavailable_log_at = now;
+        warn!(
+            "Path for resolver {} became unavailable; resetting state",
+            resolver.addr
+        );
+    }
     resolver.added = false;
     resolver.path_id = -1;
     resolver.unique_path_id = None;
@@ -316,8 +349,73 @@ pub(crate) fn reset_resolver_path(resolver: &mut ResolverState) {
     resolver.last_pacing_snapshot = None;
     resolver.probe_attempts = 0;
     resolver.next_probe_at = 0;
+    resolver.health = ResolverHealthState::Unavailable;
     resolver.active_delete_suspect_count = 0;
+    resolver.active_refresh_suspect_count = 0;
     resolver.active_delete_first_at = 0;
+}
+
+pub(crate) fn clear_active_path_suspect(resolver: &mut ResolverState) {
+    resolver.health = ResolverHealthState::Healthy;
+    resolver.active_delete_suspect_count = 0;
+    resolver.active_refresh_suspect_count = 0;
+    resolver.active_delete_first_at = 0;
+}
+
+pub(crate) fn note_active_path_delete_signal(resolver: &mut ResolverState, now: u64) {
+    if resolver.active_delete_first_at == 0
+        || now.saturating_sub(resolver.active_delete_first_at) > ACTIVE_FAILOVER_SUSPECT_WINDOW_US
+    {
+        resolver.active_delete_first_at = now;
+        resolver.active_delete_suspect_count = 1;
+        resolver.active_refresh_suspect_count = 0;
+        resolver.health = ResolverHealthState::Suspect;
+        return;
+    }
+
+    resolver.active_delete_suspect_count = resolver.active_delete_suspect_count.saturating_add(1);
+    resolver.health = ResolverHealthState::Suspect;
+}
+
+pub(crate) fn note_active_refresh_failure(resolver: &mut ResolverState, now: u64) {
+    if resolver.active_delete_first_at == 0
+        || now.saturating_sub(resolver.active_delete_first_at) > ACTIVE_FAILOVER_SUSPECT_WINDOW_US
+    {
+        resolver.active_delete_first_at = now;
+        resolver.active_delete_suspect_count = 0;
+        resolver.active_refresh_suspect_count = 1;
+        resolver.health = ResolverHealthState::Suspect;
+        return;
+    }
+
+    resolver.active_refresh_suspect_count = resolver.active_refresh_suspect_count.saturating_add(1);
+    resolver.health = ResolverHealthState::Suspect;
+}
+
+pub(crate) fn note_resolver_progress(resolver: &mut ResolverState, now: u64) {
+    resolver.last_progress_at = now;
+    if resolver.health != ResolverHealthState::Unavailable {
+        clear_active_path_suspect(resolver);
+    }
+}
+
+pub(crate) fn should_failover_active_path(resolver: &ResolverState, now: u64) -> bool {
+    if resolver.health == ResolverHealthState::Unavailable {
+        return true;
+    }
+    if resolver.health != ResolverHealthState::Suspect {
+        return false;
+    }
+    if resolver.active_delete_first_at > 0
+        && now.saturating_sub(resolver.active_delete_first_at) > ACTIVE_FAILOVER_SUSPECT_WINDOW_US
+    {
+        return false;
+    }
+    let stale_progress = resolver.last_progress_at == 0
+        || now.saturating_sub(resolver.last_progress_at) >= ACTIVE_FAILOVER_STALE_PROGRESS_US;
+    stale_progress
+        && resolver.active_delete_suspect_count >= ACTIVE_FAILOVER_MIN_DELETE_EVENTS
+        && resolver.active_refresh_suspect_count >= ACTIVE_FAILOVER_MIN_REFRESH_FAILURES
 }
 
 pub(crate) fn sockaddr_storage_to_socket_addr(
@@ -328,7 +426,10 @@ pub(crate) fn sockaddr_storage_to_socket_addr(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_resolvers, ResolverManager};
+    use super::{
+        note_active_path_delete_signal, note_active_refresh_failure, note_resolver_progress,
+        resolve_resolvers, should_failover_active_path, ResolverManager,
+    };
     use slipstream_core::state_machine::ResolverRole;
     use slipstream_core::{AddressFamily, HostPort};
     use slipstream_ffi::{ResolverMode, ResolverSpec};
@@ -460,5 +561,30 @@ mod tests {
         assert!(!manager.as_slice()[0].added);
         assert_eq!(manager.as_slice()[0].path_id, -1);
         assert_eq!(manager.as_slice()[0].unique_path_id, None);
+    }
+
+    #[test]
+    fn active_failover_requires_multi_signal_and_stale_progress() {
+        let resolvers = vec![ResolverSpec {
+            resolver: HostPort {
+                host: "127.0.0.1".to_string(),
+                port: 8853,
+                family: AddressFamily::V4,
+            },
+            mode: ResolverMode::Recursive,
+        }];
+        let mut manager = ResolverManager::from_specs(&resolvers, 900, false)
+            .expect("resolver manager should initialize");
+        let resolver = manager.active_mut();
+
+        note_resolver_progress(resolver, 1_000_000);
+        note_active_path_delete_signal(resolver, 1_100_000);
+        note_active_refresh_failure(resolver, 1_200_000);
+        assert!(!should_failover_active_path(resolver, 1_300_000));
+
+        note_active_path_delete_signal(resolver, 1_400_000);
+        note_active_refresh_failure(resolver, 1_500_000);
+        assert!(!should_failover_active_path(resolver, 2_900_000));
+        assert!(should_failover_active_path(resolver, 3_200_000));
     }
 }

@@ -66,11 +66,22 @@ pub(crate) fn should_log_health(
     ready && report_time.saturating_sub(last_health_log_at) >= interval_us
 }
 
+pub(crate) fn should_log_dual_resolver_health(
+    ready: bool,
+    resolver_count: usize,
+    report_time: u64,
+    last_log_at: u64,
+    interval_us: u64,
+) -> bool {
+    ready && resolver_count > 1 && report_time.saturating_sub(last_log_at) >= interval_us
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_last_enqueue_ms, should_log_flow_blocked, should_log_health,
-        should_reconnect_for_handshake_stall, should_reconnect_for_resolver_stall,
+        compute_last_enqueue_ms, should_log_dual_resolver_health, should_log_flow_blocked,
+        should_log_health, should_reconnect_for_handshake_stall,
+        should_reconnect_for_resolver_stall,
     };
 
     #[test]
@@ -133,5 +144,21 @@ mod tests {
         assert!(should_log_health(true, 20_000, 1_000, 10_000));
         assert!(!should_log_health(false, 20_000, 1_000, 10_000));
         assert!(!should_log_health(true, 5_000, 1_000, 10_000));
+    }
+
+    #[test]
+    fn dual_resolver_health_log_gate_requires_multi_resolver() {
+        assert!(should_log_dual_resolver_health(
+            true, 2, 20_000, 1_000, 10_000
+        ));
+        assert!(!should_log_dual_resolver_health(
+            true, 1, 20_000, 1_000, 10_000
+        ));
+        assert!(!should_log_dual_resolver_health(
+            false, 2, 20_000, 1_000, 10_000
+        ));
+        assert!(!should_log_dual_resolver_health(
+            true, 2, 5_000, 1_000, 10_000
+        ));
     }
 }

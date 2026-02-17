@@ -10,8 +10,8 @@ use self::actions::{poll_authoritative_resolver, poll_recursive_resolver, PollDi
 use self::deadlock::AcceptorSaturationTracker;
 use self::decision::{reconnect_due_to_acceptor_deadlock, reconnect_due_to_active_path_loss};
 use self::health::{
-    compute_last_enqueue_ms, should_log_flow_blocked, should_log_health,
-    should_reconnect_for_handshake_stall, should_reconnect_for_resolver_stall,
+    compute_last_enqueue_ms, should_log_dual_resolver_health, should_log_flow_blocked,
+    should_log_health, should_reconnect_for_handshake_stall, should_reconnect_for_resolver_stall,
 };
 use self::loop_policy::compute_loop_sleep_policy;
 use self::path::{
@@ -87,6 +87,7 @@ const ACCEPTOR_SATURATED_TIMEOUT_US: u64 = 30_000_000;
 /// Periodic health heartbeat log interval (5 minutes).  Emits connection
 /// state at INFO level so we can diagnose silent tunnel deaths.
 const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
+const DUAL_RESOLVER_HEALTH_LOG_INTERVAL_US: u64 = 10_000_000;
 const WATCHDOG_STALE_SECS: u64 = 15;
 const WATCHDOG_SELECT_STALE_SECS: u64 = 45;
 const WATCHDOG_SELECT_STALE_MAX_STRIKES: u32 = 3;
@@ -461,6 +462,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut last_flow_block_log_at = 0u64;
         let mut last_recv_at = 0u64;
         let mut last_health_log_at = 0u64;
+        let mut last_dual_resolver_log_at = 0u64;
         let mut acceptor_saturation = AcceptorSaturationTracker::new(ACCEPTOR_SATURATED_TIMEOUT_US);
         let watchdog = Watchdog::spawn();
 
@@ -962,6 +964,57 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
             // Periodic health heartbeat: log key metrics at INFO level so we
             // can diagnose silent tunnel deaths from production logs.
+            if should_log_dual_resolver_health(
+                ready,
+                resolver_manager.as_slice().len(),
+                report_time,
+                last_dual_resolver_log_at,
+                DUAL_RESOLVER_HEALTH_LOG_INTERVAL_US,
+            ) {
+                last_dual_resolver_log_at = report_time;
+                let active = resolver_manager.active();
+                let mut standby_total_pending = 0usize;
+                let mut standby_total_inflight = 0usize;
+                let mut standby_total_dns = 0u64;
+                let mut standby_added = 0usize;
+                for resolver in resolver_manager.as_slice() {
+                    if resolver.is_active() {
+                        continue;
+                    }
+                    if resolver.added {
+                        standby_added = standby_added.saturating_add(1);
+                    }
+                    standby_total_pending =
+                        standby_total_pending.saturating_add(resolver.pending_polls);
+                    standby_total_inflight =
+                        standby_total_inflight.saturating_add(resolver.inflight_poll_ids.len());
+                    standby_total_dns =
+                        standby_total_dns.saturating_add(resolver.debug.dns_responses);
+                }
+                info!(
+                    "dual-health: active={} active_added={} active_pending={} active_inflight={} active_dns_responses={} active_polls_sent={} active_path_rtt_us={} active_timeouts={} standby_count={} standby_added={} standby_pending={} standby_inflight={} standby_dns_responses={} streams={} recv_age={}s",
+                    active.addr,
+                    active.added,
+                    active.pending_polls,
+                    active.inflight_poll_ids.len(),
+                    active.debug.dns_responses,
+                    active.debug.polls_sent,
+                    active.debug.path_rtt_us,
+                    active.debug.inflight_poll_timeouts,
+                    resolver_manager.as_slice().len().saturating_sub(1),
+                    standby_added,
+                    standby_total_pending,
+                    standby_total_inflight,
+                    standby_total_dns,
+                    streams_len,
+                    if last_recv_at > 0 {
+                        report_time.saturating_sub(last_recv_at) / 1_000_000
+                    } else {
+                        0
+                    },
+                );
+            }
+
             if should_log_health(
                 ready,
                 report_time,

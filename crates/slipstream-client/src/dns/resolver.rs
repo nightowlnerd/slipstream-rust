@@ -46,6 +46,8 @@ pub(crate) struct ResolverState {
     pub(crate) pacing_budget: Option<PacingPollBudget>,
     pub(crate) last_pacing_snapshot: Option<PacingBudgetSnapshot>,
     pub(crate) debug: DebugMetrics,
+    pub(crate) active_delete_suspect_count: u8,
+    pub(crate) active_delete_first_at: u64,
 }
 
 impl ResolverState {
@@ -122,6 +124,8 @@ impl ResolverManager {
             resolver.last_pacing_snapshot = None;
             resolver.probe_attempts = 0;
             resolver.next_probe_at = 0;
+            resolver.active_delete_suspect_count = 0;
+            resolver.active_delete_first_at = 0;
         }
     }
 
@@ -297,6 +301,8 @@ pub(crate) fn resolve_resolvers(
             },
             last_pacing_snapshot: None,
             debug: DebugMetrics::new(debug_poll),
+            active_delete_suspect_count: 0,
+            active_delete_first_at: 0,
         });
     }
     Ok(resolved)
@@ -323,6 +329,8 @@ pub(crate) fn reset_resolver_path(resolver: &mut ResolverState) {
     resolver.last_pacing_snapshot = None;
     resolver.probe_attempts = 0;
     resolver.next_probe_at = 0;
+    resolver.active_delete_suspect_count = 0;
+    resolver.active_delete_first_at = 0;
 }
 
 pub(crate) fn sockaddr_storage_to_socket_addr(

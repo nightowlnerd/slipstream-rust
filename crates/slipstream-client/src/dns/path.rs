@@ -25,6 +25,8 @@ pub(crate) fn refresh_resolver_path(
                 resolver.path_id = path_id;
             }
             resolver.last_path_unavailable_log_at = 0;
+            resolver.active_delete_suspect_count = 0;
+            resolver.active_delete_first_at = 0;
             return true;
         }
         resolver.unique_path_id = None;
@@ -43,6 +45,8 @@ pub(crate) fn refresh_resolver_path(
         resolver.path_id = path_id;
     }
     resolver.last_path_unavailable_log_at = 0;
+    resolver.active_delete_suspect_count = 0;
+    resolver.active_delete_first_at = 0;
     true
 }
 

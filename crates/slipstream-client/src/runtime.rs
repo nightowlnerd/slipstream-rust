@@ -510,7 +510,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         resolver_manager.as_mut_slice(),
                         Some(from_index),
                         to_index,
-                        ResolverSwitchReason::TimeoutStreakExceeded,
+                        ResolverSwitchReason::HandshakeStall,
                     );
                     preferred_startup_resolver_index = to_index;
                     warn!(

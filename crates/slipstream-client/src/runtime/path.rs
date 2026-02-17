@@ -50,18 +50,6 @@ pub(crate) fn fetch_path_quality(
     quality
 }
 
-pub(crate) fn fetch_and_record_path_quality(
-    cnx: *mut picoquic_cnx_t,
-    resolver: &mut ResolverState,
-) -> slipstream_ffi::picoquic::picoquic_path_quality_t {
-    let quality = fetch_path_quality(cnx, resolver);
-    resolver.debug.path_rtt_us = quality.rtt;
-    resolver.debug.path_cwnd = quality.cwin;
-    resolver.debug.path_bytes_in_transit = quality.bytes_in_transit;
-    resolver.debug.path_pacing_rate = quality.pacing_rate;
-    quality
-}
-
 pub(crate) fn maybe_switch_active_resolver(
     resolver_manager: &mut ResolverManager,
     current_time: u64,

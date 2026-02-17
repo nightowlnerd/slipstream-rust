@@ -1,35 +1,16 @@
 mod path;
 mod setup;
 
-<<<<<<< HEAD
 use self::path::{
     apply_path_mode, drain_path_events, fetch_path_quality, find_resolver_by_addr_mut,
-    loop_burst_total, path_poll_burst_max,
-=======
-use self::actions::{poll_authoritative_resolver, poll_recursive_resolver, PollDispatch};
-use self::deadlock::AcceptorSaturationTracker;
-use self::decision::{reconnect_due_to_acceptor_deadlock, reconnect_due_to_active_path_loss};
-use self::health::{
-    compute_last_enqueue_ms, should_log_flow_blocked, should_log_health,
-    should_reconnect_for_handshake_stall, should_reconnect_for_resolver_stall,
-};
-use self::loop_policy::compute_loop_sleep_policy;
-use self::path::{
-    apply_path_mode, drain_path_events, fetch_and_record_path_quality, find_resolver_by_addr_mut,
-    loop_burst_total, maybe_switch_active_resolver,
->>>>>>> e3523a8 (fix(client): rotate startup resolver after handshake stall)
+    loop_burst_total, maybe_switch_active_resolver, path_poll_burst_max,
 };
 use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
 use crate::dns::{
     add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
     record_resolver_switch, refresh_resolver_path, resolver_mode_to_c,
-<<<<<<< HEAD
     resolver_switch_reason_catalog, send_poll_queries, sockaddr_storage_to_socket_addr,
     DnsResponseContext, ResolverManager, ResolverSwitchReason,
-=======
-    resolver_switch_reason_catalog, sockaddr_storage_to_socket_addr, DnsResponseContext,
-    ResolverManager, ResolverSwitchReason,
->>>>>>> e3523a8 (fix(client): rotate startup resolver after handshake stall)
 };
 use crate::error::ClientError;
 use crate::pacing::{cwnd_target_polls, inflight_packet_estimate};
@@ -234,40 +215,20 @@ fn drain_disconnected_commands(command_rx: &mut mpsc::UnboundedReceiver<Command>
     dropped
 }
 
-<<<<<<< HEAD
-fn maybe_switch_active_resolver(
-    resolver_manager: &mut ResolverManager,
+fn should_reconnect_for_handshake_stall(
+    ready: bool,
     current_time: u64,
-    preferred_startup_resolver_index: &mut usize,
-) {
-    if let Some((from_index, to_index, reason)) = resolver_manager.maybe_select_active(current_time)
-    {
-        *preferred_startup_resolver_index = to_index;
-        record_resolver_switch(
-            resolver_manager.as_mut_slice(),
-            Some(from_index),
-            to_index,
-            reason,
-        );
-        unsafe {
-            let mode = resolver_manager.active().mode;
-            slipstream_set_default_path_mode(resolver_mode_to_c(mode));
-        }
-=======
-fn drain_commands_by_connection_state(
-    cnx: *mut picoquic_cnx_t,
-    state_ptr: *mut ClientState,
-    command_rx: &mut mpsc::UnboundedReceiver<Command>,
-) {
-    // Only process application commands after the QUIC handshake
-    // completes. During reconnect the acceptor may queue NewStream
-    // commands while the connection is still in initial state;
-    // processing them before ready triggers picoquic errors (0xc).
-    if unsafe { (*state_ptr).is_ready() } {
-        drain_commands(cnx, state_ptr, command_rx);
+    connect_started_at: u64,
+    timeout_us: u64,
+) -> Option<u64> {
+    if ready || connect_started_at == 0 {
+        return None;
+    }
+    let elapsed = current_time.saturating_sub(connect_started_at);
+    if elapsed >= timeout_us {
+        Some(elapsed)
     } else {
-        let _ = drain_disconnected_commands(command_rx);
->>>>>>> e3523a8 (fix(client): rotate startup resolver after handshake stall)
+        None
     }
 }
 
@@ -717,7 +678,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     &mut resolver_manager,
                     current_time,
                     &mut preferred_startup_resolver_index,
-<<<<<<< HEAD
                 );
                 let streams_len = unsafe { (*state_ptr).streams_len() };
                 let active_path_ready = resolver_manager.active().added;
@@ -728,13 +688,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     );
                     break;
                 }
-=======
-                    state_ptr,
-                    ACTIVE_PATH_LOSS_RECONNECT_STREAMS,
-                )
-            {
-                break;
->>>>>>> e3523a8 (fix(client): rotate startup resolver after handshake stall)
             }
             let reaped_half_closed = unsafe {
                 let now = picoquic_current_time();

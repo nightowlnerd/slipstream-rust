@@ -77,6 +77,7 @@ pub(crate) enum ResolverSwitchReason {
     ManualOverride,
     ProbeRecovery,
     TimeoutStreakExceeded,
+    HandshakeStall,
     LossSpike,
     LatencyRegression,
     PathUnavailable,
@@ -84,11 +85,12 @@ pub(crate) enum ResolverSwitchReason {
 }
 
 pub(crate) fn resolver_switch_reason_catalog() -> &'static [ResolverSwitchReason] {
-    static REASONS: [ResolverSwitchReason; 8] = [
+    static REASONS: [ResolverSwitchReason; 9] = [
         ResolverSwitchReason::StartupPrimary,
         ResolverSwitchReason::ManualOverride,
         ResolverSwitchReason::ProbeRecovery,
         ResolverSwitchReason::TimeoutStreakExceeded,
+        ResolverSwitchReason::HandshakeStall,
         ResolverSwitchReason::LossSpike,
         ResolverSwitchReason::LatencyRegression,
         ResolverSwitchReason::PathUnavailable,
@@ -104,6 +106,7 @@ impl ResolverSwitchReason {
             ResolverSwitchReason::ManualOverride => "manual_override",
             ResolverSwitchReason::ProbeRecovery => "probe_recovery",
             ResolverSwitchReason::TimeoutStreakExceeded => "timeout_streak_exceeded",
+            ResolverSwitchReason::HandshakeStall => "handshake_stall",
             ResolverSwitchReason::LossSpike => "loss_spike",
             ResolverSwitchReason::LatencyRegression => "latency_regression",
             ResolverSwitchReason::PathUnavailable => "path_unavailable",
@@ -262,6 +265,10 @@ mod tests {
         assert_eq!(
             ResolverSwitchReason::TimeoutStreakExceeded.as_str(),
             "timeout_streak_exceeded"
+        );
+        assert_eq!(
+            ResolverSwitchReason::HandshakeStall.as_str(),
+            "handshake_stall"
         );
         assert_eq!(ResolverSwitchReason::LossSpike.as_str(), "loss_spike");
         assert_eq!(

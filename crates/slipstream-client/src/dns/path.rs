@@ -7,7 +7,10 @@ use slipstream_ffi::picoquic::{
 use slipstream_ffi::ResolverMode;
 use tracing::{info, warn};
 
-use super::resolver::{reset_resolver_path, ResolverState};
+use super::resolver::{
+    clear_active_path_suspect, note_active_refresh_failure, reset_resolver_path,
+    should_failover_active_path, ResolverState,
+};
 
 const PATH_PROBE_INITIAL_DELAY_US: u64 = 250_000;
 const PATH_PROBE_MAX_DELAY_US: u64 = 10_000_000;
@@ -25,8 +28,7 @@ pub(crate) fn refresh_resolver_path(
                 resolver.path_id = path_id;
             }
             resolver.last_path_unavailable_log_at = 0;
-            resolver.active_delete_suspect_count = 0;
-            resolver.active_delete_first_at = 0;
+            clear_active_path_suspect(resolver);
             return true;
         }
         resolver.unique_path_id = None;
@@ -34,7 +36,13 @@ pub(crate) fn refresh_resolver_path(
     let peer = &resolver.storage as *const _ as *const libc::sockaddr;
     let path_id = unsafe { slipstream_find_path_id_by_addr(cnx, peer) };
     if path_id < 0 {
-        if resolver.added || resolver.path_id >= 0 {
+        if resolver.is_active() {
+            let now = unsafe { picoquic_current_time() };
+            note_active_refresh_failure(resolver, now);
+            if should_failover_active_path(resolver, now) {
+                reset_resolver_path(resolver);
+            }
+        } else if resolver.added || resolver.path_id >= 0 {
             reset_resolver_path(resolver);
         }
         return false;
@@ -45,8 +53,7 @@ pub(crate) fn refresh_resolver_path(
         resolver.path_id = path_id;
     }
     resolver.last_path_unavailable_log_at = 0;
-    resolver.active_delete_suspect_count = 0;
-    resolver.active_delete_first_at = 0;
+    clear_active_path_suspect(resolver);
     true
 }
 

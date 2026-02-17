@@ -115,11 +115,7 @@ impl ResolverManager {
             };
             resolver.added = resolver_index == index;
             resolver.path_id = if resolver_index == index { 0 } else { -1 };
-            resolver.unique_path_id = if resolver_index == index {
-                Some(0)
-            } else {
-                None
-            };
+            resolver.unique_path_id = None;
             resolver.local_addr_storage = None;
             resolver.pending_polls = 0;
             resolver.inflight_poll_ids.clear();
@@ -288,7 +284,7 @@ pub(crate) fn resolve_resolvers(
             },
             added: is_primary,
             path_id: if is_primary { 0 } else { -1 },
-            unique_path_id: if is_primary { Some(0) } else { None },
+            unique_path_id: None,
             probe_attempts: 0,
             next_probe_at: 0,
             last_probe_failure_log_at: 0,
@@ -465,7 +461,7 @@ mod tests {
         assert_eq!(manager.active_index(), 1);
         assert!(manager.as_slice()[1].added);
         assert_eq!(manager.as_slice()[1].path_id, 0);
-        assert_eq!(manager.as_slice()[1].unique_path_id, Some(0));
+        assert_eq!(manager.as_slice()[1].unique_path_id, None);
         assert!(!manager.as_slice()[0].added);
         assert_eq!(manager.as_slice()[0].path_id, -1);
         assert_eq!(manager.as_slice()[0].unique_path_id, None);

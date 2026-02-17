@@ -62,6 +62,7 @@ pub(crate) struct ResolverState {
     pub(crate) active_refresh_suspect_count: u8,
     pub(crate) active_delete_first_at: u64,
     pub(crate) last_progress_at: u64,
+    pub(crate) last_recursive_poll_sent_at: u64,
 }
 
 impl ResolverState {
@@ -143,6 +144,7 @@ impl ResolverManager {
             resolver.active_refresh_suspect_count = 0;
             resolver.active_delete_first_at = 0;
             resolver.last_progress_at = 0;
+            resolver.last_recursive_poll_sent_at = 0;
         }
     }
 
@@ -323,6 +325,7 @@ pub(crate) fn resolve_resolvers(
             active_refresh_suspect_count: 0,
             active_delete_first_at: 0,
             last_progress_at: 0,
+            last_recursive_poll_sent_at: 0,
         });
     }
     Ok(resolved)
@@ -353,6 +356,7 @@ pub(crate) fn reset_resolver_path(resolver: &mut ResolverState) {
     resolver.active_delete_suspect_count = 0;
     resolver.active_refresh_suspect_count = 0;
     resolver.active_delete_first_at = 0;
+    resolver.last_recursive_poll_sent_at = 0;
 }
 
 pub(crate) fn clear_active_path_suspect(resolver: &mut ResolverState) {

@@ -896,7 +896,15 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                             dns_id: &mut dns_id,
                             send_buf: &mut send_buf,
                         };
-                        poll_recursive_resolver(cnx, &mut dispatch, resolver).await?;
+                        poll_recursive_resolver(
+                            cnx,
+                            &mut dispatch,
+                            resolver,
+                            has_ready_stream,
+                            flow_blocked,
+                            sent_quic_data,
+                        )
+                        .await?;
                     }
                 }
             }

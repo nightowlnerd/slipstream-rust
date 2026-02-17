@@ -6,10 +6,15 @@ use slipstream_core::tcp::{stream_read_limit_chunks, tcp_send_buffer_bytes};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream as TokioTcpStream;
 use tokio::sync::{mpsc, watch};
+use tokio::time::sleep;
 use tracing::{debug, warn};
+
+const TARGET_CONNECT_MAX_ATTEMPTS: usize = 5;
+const TARGET_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub(crate) fn spawn_target_connector(
     key: StreamKey,
@@ -22,13 +27,34 @@ pub(crate) fn spawn_target_connector(
         if *shutdown_rx.borrow() {
             return;
         }
-        let connect = TokioTcpStream::connect(target_addr);
-        let stream = tokio::select! {
-            _ = shutdown_rx.changed() => {
-                return;
+        let mut stream = Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "target connect not attempted",
+        ));
+        let mut attempts = 0usize;
+        for attempt in 1..=TARGET_CONNECT_MAX_ATTEMPTS {
+            attempts = attempt;
+            let connect = TokioTcpStream::connect(target_addr);
+            stream = tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    return;
+                }
+                result = connect => result,
+            };
+            let should_retry = matches!(
+                stream,
+                Err(ref err) if err.kind() == std::io::ErrorKind::ConnectionRefused
+            ) && attempt < TARGET_CONNECT_MAX_ATTEMPTS;
+            if !should_retry {
+                break;
             }
-            result = connect => result,
-        };
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    return;
+                }
+                _ = sleep(TARGET_CONNECT_RETRY_DELAY) => {}
+            }
+        }
         if *shutdown_rx.borrow() {
             return;
         }
@@ -74,8 +100,9 @@ pub(crate) fn spawn_target_connector(
             }
             Err(err) => {
                 warn!(
-                    "stream {:?}: target connect failed err={} kind={:?}",
+                    "stream {:?}: target connect failed after {} attempt(s) err={} kind={:?}",
                     key.stream_id,
+                    attempts,
                     err,
                     err.kind()
                 );

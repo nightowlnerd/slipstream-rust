@@ -1,0 +1,162 @@
+use crate::dns::{send_poll_queries, ResolverState};
+use crate::error::ClientError;
+use crate::pacing::{cwnd_target_polls, inflight_packet_estimate};
+use slipstream_ffi::picoquic::picoquic_cnx_t;
+use slipstream_ffi::{ClientConfig, ResolverMode};
+use tokio::net::UdpSocket as TokioUdpSocket;
+use tracing::debug;
+
+use super::path::{fetch_path_quality, path_poll_burst_max};
+
+const RECURSIVE_POLL_MIN_INTERVAL_US_ACTIVE: u64 = 1_000;
+const RECURSIVE_POLL_MIN_INTERVAL_US_IDLE: u64 = 500;
+const RECURSIVE_POLL_BURST_ACTIVE_STREAMS: usize = 2;
+const RECURSIVE_POLL_BURST_IDLE: usize = 8;
+
+pub(crate) struct PollDispatch<'a, 'cfg> {
+    pub(crate) udp: &'a TokioUdpSocket,
+    pub(crate) config: &'a ClientConfig<'cfg>,
+    pub(crate) local_addr_storage: &'a mut libc::sockaddr_storage,
+    pub(crate) dns_id: &'a mut u16,
+    pub(crate) send_buf: &'a mut [u8],
+}
+
+pub(crate) async fn poll_authoritative_resolver(
+    cnx: *mut picoquic_cnx_t,
+    dispatch: &mut PollDispatch<'_, '_>,
+    resolver: &mut ResolverState,
+    mtu: u32,
+    has_ready_stream: bool,
+    flow_blocked: bool,
+    sent_quic_data: bool,
+) -> Result<(), ClientError> {
+    let quality = fetch_path_quality(cnx, resolver);
+    resolver.debug.path_rtt_us = quality.rtt;
+    resolver.debug.path_cwnd = quality.cwin;
+    resolver.debug.path_bytes_in_transit = quality.bytes_in_transit;
+    resolver.debug.path_pacing_rate = quality.pacing_rate;
+
+    let snapshot = resolver.last_pacing_snapshot;
+    let pacing_target = snapshot
+        .map(|snapshot| snapshot.target_inflight)
+        .unwrap_or_else(|| cwnd_target_polls(quality.cwin, mtu));
+    let inflight_packets = inflight_packet_estimate(quality.bytes_in_transit, mtu);
+    let mut poll_deficit = pacing_target.saturating_sub(inflight_packets);
+
+    if has_ready_stream && !flow_blocked && sent_quic_data {
+        poll_deficit = 0;
+    }
+
+    if poll_deficit > 0 && resolver.debug.enabled {
+        debug!(
+            "cc_state: {} cwnd={} in_transit={} rtt_us={} flow_blocked={} deficit={}",
+            resolver.label(),
+            quality.cwin,
+            quality.bytes_in_transit,
+            quality.rtt,
+            flow_blocked,
+            poll_deficit
+        );
+    }
+
+    if poll_deficit > 0 {
+        let burst_max = path_poll_burst_max(resolver);
+        let mut to_send = poll_deficit.min(burst_max);
+        send_poll_queries(
+            cnx,
+            dispatch.udp,
+            dispatch.config,
+            dispatch.local_addr_storage,
+            dispatch.dns_id,
+            resolver,
+            &mut to_send,
+            dispatch.send_buf,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn poll_recursive_resolver(
+    cnx: *mut picoquic_cnx_t,
+    dispatch: &mut PollDispatch<'_, '_>,
+    resolver: &mut ResolverState,
+    multi_resolver_mode: bool,
+    has_ready_stream: bool,
+    flow_blocked: bool,
+) -> Result<(), ClientError> {
+    if resolver.mode != ResolverMode::Recursive {
+        return Ok(());
+    }
+
+    resolver.last_pacing_snapshot = None;
+    if resolver.pending_polls == 0 {
+        return Ok(());
+    }
+
+    let now = unsafe { slipstream_ffi::picoquic::picoquic_current_time() };
+    if multi_resolver_mode {
+        let min_interval = if has_ready_stream {
+            RECURSIVE_POLL_MIN_INTERVAL_US_ACTIVE
+        } else {
+            RECURSIVE_POLL_MIN_INTERVAL_US_IDLE
+        };
+        if resolver.last_recursive_poll_sent_at > 0
+            && now.saturating_sub(resolver.last_recursive_poll_sent_at) < min_interval
+        {
+            return Ok(());
+        }
+    }
+
+    let burst_max = path_poll_burst_max(resolver);
+    let burst_cap = if multi_resolver_mode {
+        if has_ready_stream && !flow_blocked {
+            RECURSIVE_POLL_BURST_ACTIVE_STREAMS
+        } else {
+            RECURSIVE_POLL_BURST_IDLE
+        }
+    } else {
+        burst_max
+    };
+    let burst_max = burst_max.min(burst_cap.max(1));
+    let polls_sent_before = resolver.debug.polls_sent;
+    if resolver.pending_polls > burst_max {
+        let mut to_send = burst_max;
+        send_poll_queries(
+            cnx,
+            dispatch.udp,
+            dispatch.config,
+            dispatch.local_addr_storage,
+            dispatch.dns_id,
+            resolver,
+            &mut to_send,
+            dispatch.send_buf,
+        )
+        .await?;
+        resolver.pending_polls = resolver
+            .pending_polls
+            .saturating_sub(burst_max)
+            .saturating_add(to_send);
+    } else {
+        let mut pending = resolver.pending_polls;
+        send_poll_queries(
+            cnx,
+            dispatch.udp,
+            dispatch.config,
+            dispatch.local_addr_storage,
+            dispatch.dns_id,
+            resolver,
+            &mut pending,
+            dispatch.send_buf,
+        )
+        .await?;
+        resolver.pending_polls = pending;
+    }
+
+    if resolver.debug.polls_sent > polls_sent_before {
+        resolver.last_recursive_poll_sent_at = now;
+    }
+
+    Ok(())
+}

@@ -203,7 +203,11 @@ fn epipe_triggers_quic_reset() {
 
     let saw_local_error = wait_for_any_log(
         &client_logs,
-        &["tcp write error", "tcp read error"],
+        &[
+            "tcp write error",
+            "tcp read error",
+            "tcp write channel closed",
+        ],
         Duration::from_secs(2),
     );
     if saw_local_error.is_none() {

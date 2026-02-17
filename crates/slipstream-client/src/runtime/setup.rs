@@ -1,22 +1,19 @@
 use crate::error::ClientError;
+use slipstream_dns::max_payload_len_for_domain;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use tokio::net::{lookup_host, TcpListener as TokioTcpListener, UdpSocket as TokioUdpSocket};
 use tracing::warn;
 
-pub(crate) fn compute_mtu(domain_len: usize) -> Result<u32, ClientError> {
-    if domain_len >= 240 {
-        return Err(ClientError::new(
-            "Domain name is too long for DNS transport",
-        ));
-    }
-    let mtu = ((240.0 - domain_len as f64) / 1.6) as u32;
+pub(crate) fn compute_mtu(domain: &str) -> Result<u32, ClientError> {
+    let mtu =
+        max_payload_len_for_domain(domain).map_err(|err| ClientError::new(err.to_string()))?;
     if mtu == 0 {
         return Err(ClientError::new(
             "MTU computed to zero; check domain length",
         ));
     }
-    Ok(mtu)
+    u32::try_from(mtu).map_err(|_| ClientError::new("MTU conversion overflow"))
 }
 
 pub(crate) async fn bind_udp_socket() -> Result<TokioUdpSocket, ClientError> {

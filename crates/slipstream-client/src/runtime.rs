@@ -76,6 +76,8 @@ const ACCEPTOR_SATURATED_TIMEOUT_US: u64 = 30_000_000;
 const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
 const WATCHDOG_STALE_SECS: u64 = 15;
 const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+const WATCHDOG_ABORT_STRIKES: u32 = 3;
+const WATCHDOG_SELECT_ABORT_SECS: u64 = 45;
 const ACTIVE_PATH_LOSS_RECONNECT_STREAMS: usize = 32;
 
 /// Watchdog that runs on a separate OS thread (not tokio) to detect when the
@@ -128,6 +130,7 @@ impl Watchdog {
             .name("watchdog".into())
             .spawn(move || {
                 let mut last_check = Instant::now();
+                let mut stale_strikes = 0u32;
                 while al.load(Ordering::Relaxed) {
                     std::thread::sleep(WATCHDOG_CHECK_INTERVAL);
                     if !al.load(Ordering::Relaxed) {
@@ -136,6 +139,7 @@ impl Watchdog {
                     let now_instant = Instant::now();
                     let ts = hb.load(Ordering::Relaxed);
                     if ts == 0 {
+                        stale_strikes = 0;
                         last_check = now_instant;
                         continue;
                     }
@@ -149,6 +153,7 @@ impl Watchdog {
                     if stale_us > WATCHDOG_STALE_SECS * 1_000_000
                         && own_sleep_us > expected_sleep_us * 3
                     {
+                        stale_strikes = 0;
                         let stuck_phase = ph.load(Ordering::Relaxed);
                         eprintln!(
                             "WATCHDOG: VPS suspend detected ({:.1}s gap, own sleep {:.1}s), \
@@ -162,14 +167,33 @@ impl Watchdog {
                         continue;
                     }
                     if stale_us > WATCHDOG_STALE_SECS * 1_000_000 {
+                        stale_strikes = stale_strikes.saturating_add(1);
                         let stuck_phase = ph.load(Ordering::Relaxed);
+                        let phase_name = phase_name(stuck_phase);
+                        let allow_abort = if stuck_phase == PHASE_SELECT {
+                            stale_us >= WATCHDOG_SELECT_ABORT_SECS * 1_000_000
+                        } else {
+                            true
+                        };
+                        if allow_abort && stale_strikes >= WATCHDOG_ABORT_STRIKES {
+                            eprintln!(
+                                "WATCHDOG: main loop stalled for {:.1}s at phase {} ({}), strikes={}, aborting process",
+                                stale_us as f64 / 1_000_000.0,
+                                stuck_phase,
+                                phase_name,
+                                stale_strikes,
+                            );
+                            std::process::abort();
+                        }
                         eprintln!(
-                            "WATCHDOG: main loop stalled for {:.1}s at phase {} ({}), aborting process",
+                            "WATCHDOG: stale heartbeat {:.1}s at phase {} ({}), strikes={}, waiting",
                             stale_us as f64 / 1_000_000.0,
                             stuck_phase,
-                            phase_name(stuck_phase),
+                            phase_name,
+                            stale_strikes,
                         );
-                        std::process::abort();
+                    } else {
+                        stale_strikes = 0;
                     }
                 }
             })

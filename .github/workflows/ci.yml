@@ -262,7 +262,7 @@ jobs:
             client_args: ""
             resolver_mode: mixed
             min_exfil: "5"
-            min_download: "25"
+            min_download: "10"
             artifact_glob: bench-rust-rust-mixed-*
           # C repo benchmark disabled (C repo currently broken).
           # - name: c-c

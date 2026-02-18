@@ -77,13 +77,15 @@ const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
 const WATCHDOG_STALE_SECS: u64 = 15;
 const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 const WATCHDOG_ABORT_STRIKES: u32 = 3;
-const WATCHDOG_SELECT_ABORT_SECS: u64 = 45;
 const ACTIVE_PATH_LOSS_RECONNECT_STREAMS: usize = 32;
 
 /// Watchdog that runs on a separate OS thread (not tokio) to detect when the
 /// single-threaded tokio runtime freezes (e.g. a picoquic C FFI call hangs).
 /// If the main loop hasn't updated the heartbeat for WATCHDOG_STALE_SECS,
-/// the watchdog aborts the process so systemd can restart it.
+/// the watchdog emits warnings and only aborts in non-select phases.
+///
+/// `PHASE_SELECT` may legitimately appear stale under host scheduler jitter,
+/// so aborting there creates false outages.
 struct Watchdog {
     heartbeat: Arc<AtomicU64>,
     phase: Arc<AtomicU32>,
@@ -170,12 +172,17 @@ impl Watchdog {
                         stale_strikes = stale_strikes.saturating_add(1);
                         let stuck_phase = ph.load(Ordering::Relaxed);
                         let phase_name = phase_name(stuck_phase);
-                        let allow_abort = if stuck_phase == PHASE_SELECT {
-                            stale_us >= WATCHDOG_SELECT_ABORT_SECS * 1_000_000
-                        } else {
-                            true
-                        };
-                        if allow_abort && stale_strikes >= WATCHDOG_ABORT_STRIKES {
+                        if stuck_phase == PHASE_SELECT {
+                            eprintln!(
+                                "WATCHDOG: stale heartbeat {:.1}s at phase {} ({}), strikes={}, waiting (select phase never aborts)",
+                                stale_us as f64 / 1_000_000.0,
+                                stuck_phase,
+                                phase_name,
+                                stale_strikes,
+                            );
+                            continue;
+                        }
+                        if stale_strikes >= WATCHDOG_ABORT_STRIKES {
                             eprintln!(
                                 "WATCHDOG: main loop stalled for {:.1}s at phase {} ({}), strikes={}, aborting process",
                                 stale_us as f64 / 1_000_000.0,

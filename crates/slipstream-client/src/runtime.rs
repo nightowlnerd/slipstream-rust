@@ -66,6 +66,13 @@ const HALF_CLOSE_IDLE_TIMEOUT_US: u64 = 60_000_000;
 /// this long.  When flow control deadlocks prevent streams from completing,
 /// picoquic cannot extend MAX_STREAMS and the tunnel is effectively dead.
 const ACCEPTOR_SATURATED_TIMEOUT_US: u64 = 30_000_000;
+const ACCEPTOR_SATURATED_TIMEOUT_SECS_ENV: &str = "SLIPSTREAM_ACCEPTOR_SATURATED_TIMEOUT_SECS";
+const SINGLE_RESOLVER_PRESSURE_TIMEOUT_SECS_ENV: &str =
+    "SLIPSTREAM_SINGLE_RESOLVER_PRESSURE_TIMEOUT_SECS";
+const SINGLE_RESOLVER_PRESSURE_RATIO_PCT: usize = 90;
+const ACCEPTOR_PRESSURE_WARN_RATIO_PCT: usize = 85;
+const RECONNECT_BURST_WARN_WINDOW_US: u64 = 120_000_000;
+const RECONNECT_BURST_WARN_COUNT: u32 = 3;
 /// Periodic health heartbeat log interval (5 minutes).  Emits connection
 /// state at INFO level so we can diagnose silent tunnel deaths.
 const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
@@ -209,6 +216,32 @@ fn drain_disconnected_commands(command_rx: &mut mpsc::UnboundedReceiver<Command>
     dropped
 }
 
+fn parse_timeout_env_secs(name: &str) -> Option<u64> {
+    match std::env::var(name) {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(0) => {
+                warn!("{}=0 disables override", name);
+                None
+            }
+            Ok(secs) => Some(secs.saturating_mul(1_000_000)),
+            Err(_) => {
+                warn!("{}='{}' is invalid; ignoring override", name, raw);
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+fn acceptor_saturated_timeout_us() -> u64 {
+    parse_timeout_env_secs(ACCEPTOR_SATURATED_TIMEOUT_SECS_ENV)
+        .unwrap_or(ACCEPTOR_SATURATED_TIMEOUT_US)
+}
+
+fn single_resolver_pressure_timeout_us() -> Option<u64> {
+    parse_timeout_env_secs(SINGLE_RESOLVER_PRESSURE_TIMEOUT_SECS_ENV)
+}
+
 pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     let domain_len = config.domain.len();
     let mtu = compute_mtu(domain_len)?;
@@ -272,6 +305,10 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
     let _state = state;
 
     let mut reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
+    let acceptor_saturation_timeout_us = acceptor_saturated_timeout_us();
+    let single_resolver_pressure_timeout_us = single_resolver_pressure_timeout_us();
+    let mut reconnect_burst_window_start = 0u64;
+    let mut reconnect_burst_count = 0u32;
 
     loop {
         let mut resolvers = resolve_resolvers(config.resolvers, mtu, config.debug_poll)?;
@@ -388,6 +425,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut acceptor_saturated_since: u64 = 0;
         let mut acceptor_saturated_max: usize = 0;
         let mut acceptor_saturated_bytes: u64 = 0;
+        let mut single_resolver_pressure_since: u64 = 0;
         let watchdog = Watchdog::spawn();
 
         // Clear closing flag that picoquic_free (QuicGuard::drop) may have
@@ -608,11 +646,11 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         acceptor_saturated_max = max;
                         acceptor_saturated_bytes = total_bytes;
                     } else if now.saturating_sub(acceptor_saturated_since)
-                        >= ACCEPTOR_SATURATED_TIMEOUT_US
+                        >= acceptor_saturation_timeout_us
                     {
                         warn!(
                             "acceptor deadlock for {}s ({}/{}, bytes={}, no progress), forcing reconnect",
-                            ACCEPTOR_SATURATED_TIMEOUT_US / 1_000_000,
+                            acceptor_saturation_timeout_us / 1_000_000,
                             used,
                             max,
                             total_bytes
@@ -621,6 +659,30 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                     }
                 } else {
                     acceptor_saturated_since = 0;
+                }
+
+                if let Some(timeout_us) = single_resolver_pressure_timeout_us {
+                    if resolvers.len() == 1
+                        && max > 0
+                        && used.saturating_mul(100)
+                            >= max.saturating_mul(SINGLE_RESOLVER_PRESSURE_RATIO_PCT)
+                    {
+                        let now = unsafe { picoquic_current_time() };
+                        if single_resolver_pressure_since == 0 {
+                            single_resolver_pressure_since = now;
+                        } else if now.saturating_sub(single_resolver_pressure_since) >= timeout_us {
+                            warn!(
+                                "single-resolver pressure for {}s at acceptor {}/{} (>= {}%); forcing reconnect",
+                                timeout_us / 1_000_000,
+                                used,
+                                max,
+                                SINGLE_RESOLVER_PRESSURE_RATIO_PCT,
+                            );
+                            break;
+                        }
+                    } else {
+                        single_resolver_pressure_since = 0;
+                    }
                 }
             }
 
@@ -910,6 +972,19 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 } else {
                     0
                 };
+                if acceptor_max > 0
+                    && acceptor_used.saturating_mul(100)
+                        >= acceptor_max.saturating_mul(ACCEPTOR_PRESSURE_WARN_RATIO_PCT)
+                {
+                    warn!(
+                        "acceptor pressure high: {}/{} ({}%), streams={}, zero_send_with_streams={}",
+                        acceptor_used,
+                        acceptor_max,
+                        acceptor_used.saturating_mul(100) / acceptor_max,
+                        streams_len,
+                        zero_send_with_streams,
+                    );
+                }
                 info!(
                     "health: streams={} cnx_state={:?} recv_age={}s acceptor={}/{} zero_send_with_streams={} data_ready_skips={}",
                     streams_len,
@@ -933,6 +1008,22 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let dropped = drain_disconnected_commands(&mut command_rx);
         if dropped > 0 {
             warn!("Dropped {} queued commands while reconnecting", dropped);
+        }
+        let now = unsafe { picoquic_current_time() };
+        if reconnect_burst_window_start == 0
+            || now.saturating_sub(reconnect_burst_window_start) > RECONNECT_BURST_WARN_WINDOW_US
+        {
+            reconnect_burst_window_start = now;
+            reconnect_burst_count = 1;
+        } else {
+            reconnect_burst_count = reconnect_burst_count.saturating_add(1);
+        }
+        if reconnect_burst_count >= RECONNECT_BURST_WARN_COUNT {
+            warn!(
+                "reconnect burst: {} reconnects within {}s",
+                reconnect_burst_count,
+                RECONNECT_BURST_WARN_WINDOW_US / 1_000_000,
+            );
         }
         warn!(
             "Connection closed; reconnecting in {}ms",

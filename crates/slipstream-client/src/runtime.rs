@@ -484,6 +484,8 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         let mut acceptor_saturated_since: u64 = 0;
         let mut acceptor_saturated_max: usize = 0;
         let mut acceptor_saturated_bytes: u64 = 0;
+        let mut reached_ready = false;
+        let mut rotated_on_handshake_stall = false;
         let watchdog = Watchdog::spawn();
 
         // Clear closing flag that picoquic_free (QuicGuard::drop) may have
@@ -530,6 +532,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
             }
 
             let ready = unsafe { (*state_ptr).is_ready() };
+            if ready {
+                reached_ready = true;
+            }
             if let Some(stall_us) = should_reconnect_for_handshake_stall(
                 ready,
                 current_time,
@@ -548,6 +553,7 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                         to_index,
                         ResolverSwitchReason::HandshakeStall,
                     );
+                    rotated_on_handshake_stall = true;
                     preferred_startup_resolver_index = to_index;
                     warn!(
                         "handshake stall for {:.1}s on startup resolver {}; rotating startup resolver to {} and reconnecting",
@@ -1136,6 +1142,19 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
 
         unsafe {
             picoquic_close(cnx, 0);
+        }
+
+        if !reached_ready && !rotated_on_handshake_stall && resolver_manager.as_slice().len() > 1 {
+            let from_index = resolver_manager.active_index();
+            let to_index = (from_index + 1) % resolver_manager.as_slice().len();
+            let from_addr = resolver_manager.as_slice()[from_index].addr;
+            let to_addr = resolver_manager.as_slice()[to_index].addr;
+            preferred_startup_resolver_index = to_index;
+            warn!(
+                "connection closed before ready on startup resolver {}; rotating startup resolver to {} for next attempt",
+                from_addr,
+                to_addr,
+            );
         }
 
         unsafe {

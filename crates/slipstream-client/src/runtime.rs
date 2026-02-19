@@ -79,19 +79,19 @@ const HEALTH_LOG_INTERVAL_US: u64 = 300_000_000;
 const WATCHDOG_STALE_SECS: u64 = 15;
 const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 const WATCHDOG_ABORT_STRIKES: u32 = 3;
-const WATCHDOG_SELECT_RECONNECT_SECS: u64 = 30;
-const WATCHDOG_SELECT_ABORT_SECS: u64 = 180;
+const WATCHDOG_SELECT_ABORT_SECS: u64 = 45;
 
 /// Watchdog that runs on a separate OS thread (not tokio) to detect when the
 /// single-threaded tokio runtime freezes (e.g. a picoquic C FFI call hangs).
 /// If the main loop hasn't updated the heartbeat for WATCHDOG_STALE_SECS,
-/// the watchdog requests reconnect for select/sleep stalls first, then aborts
-/// only as a last resort.
+/// the watchdog aborts the process so systemd can restart it.
+///
+/// `PHASE_SELECT` is noisy under scheduler jitter, so it gets a longer cap
+/// before aborting to limit false positives while still bounding outage length.
 struct Watchdog {
     heartbeat: Arc<AtomicU64>,
     phase: Arc<AtomicU32>,
     alive: Arc<AtomicBool>,
-    select_reconnect_requested: Arc<AtomicBool>,
     _handle: std::thread::JoinHandle<()>,
 }
 
@@ -127,11 +127,9 @@ impl Watchdog {
         let heartbeat = Arc::new(AtomicU64::new(0));
         let phase = Arc::new(AtomicU32::new(0));
         let alive = Arc::new(AtomicBool::new(true));
-        let select_reconnect_requested = Arc::new(AtomicBool::new(false));
         let hb = Arc::clone(&heartbeat);
         let ph = Arc::clone(&phase);
         let al = Arc::clone(&alive);
-        let reconnect_flag = Arc::clone(&select_reconnect_requested);
         let handle = std::thread::Builder::new()
             .name("watchdog".into())
             .spawn(move || {
@@ -176,18 +174,9 @@ impl Watchdog {
                         stale_strikes = stale_strikes.saturating_add(1);
                         let stuck_phase = ph.load(Ordering::Relaxed);
                         if stuck_phase == PHASE_SELECT {
-                            if stale_us >= WATCHDOG_SELECT_RECONNECT_SECS * 1_000_000 {
-                                let first_request = !reconnect_flag.swap(true, Ordering::Relaxed);
-                                if first_request {
-                                    eprintln!(
-                                        "WATCHDOG: select phase stale for {:.1}s; requesting reconnect",
-                                        stale_us as f64 / 1_000_000.0,
-                                    );
-                                }
-                            }
                             if stale_us >= WATCHDOG_SELECT_ABORT_SECS * 1_000_000 {
                                 eprintln!(
-                                    "WATCHDOG: select phase stalled for {:.1}s at phase {} ({}), aborting as last resort",
+                                    "WATCHDOG: select phase stalled for {:.1}s at phase {} ({}), aborting process",
                                     stale_us as f64 / 1_000_000.0,
                                     stuck_phase,
                                     phase_name(stuck_phase),
@@ -195,11 +184,12 @@ impl Watchdog {
                                 std::process::abort();
                             }
                             eprintln!(
-                                "WATCHDOG: stale heartbeat {:.1}s at phase {} ({}), strikes={}, waiting (select phase uses reconnect-first policy)",
+                                "WATCHDOG: stale heartbeat {:.1}s at phase {} ({}), strikes={}, waiting (select cap {}s)",
                                 stale_us as f64 / 1_000_000.0,
                                 stuck_phase,
                                 phase_name(stuck_phase),
                                 stale_strikes,
+                                WATCHDOG_SELECT_ABORT_SECS,
                             );
                             continue;
                         }
@@ -231,7 +221,6 @@ impl Watchdog {
             heartbeat,
             phase,
             alive,
-            select_reconnect_requested,
             _handle: handle,
         }
     }
@@ -243,11 +232,6 @@ impl Watchdog {
 
     fn set_phase(&self, p: u32) {
         self.phase.store(p, Ordering::Relaxed);
-    }
-
-    fn take_select_reconnect_requested(&self) -> bool {
-        self.select_reconnect_requested
-            .swap(false, Ordering::Relaxed)
     }
 }
 
@@ -495,12 +479,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
         loop {
             watchdog.pet();
             watchdog.set_phase(PHASE_DRAIN_COMMANDS);
-            if watchdog.take_select_reconnect_requested() {
-                warn!(
-                    "watchdog requested reconnect after select-phase stall; recycling connection"
-                );
-                break;
-            }
             let current_time = unsafe { picoquic_current_time() };
             // Only process application commands after the QUIC handshake
             // completes.  During reconnect the acceptor may queue NewStream
@@ -665,12 +643,6 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
                 );
             }
             watchdog.pet();
-            if watchdog.take_select_reconnect_requested() {
-                warn!(
-                    "watchdog requested reconnect after select-phase stall; recycling connection"
-                );
-                break;
-            }
 
             watchdog.set_phase(PHASE_POST_DRAIN);
             if unsafe { (*state_ptr).is_ready() } {
